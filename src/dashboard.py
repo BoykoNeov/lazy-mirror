@@ -1315,6 +1315,44 @@ def _rewrite_html(raw: bytes, page_url: str, url_map: dict,
 
     text = re.sub(r'url\(["\']?(/[^"\')\s]+)["\']?\)', _fix_root_url, text, flags=re.IGNORECASE)
 
+    # Bare relative src/href paths (e.g. "images/foo.gif", not starting with / or scheme)
+    # Needed when the stored path is deeper than the URL implies — e.g. the root URL
+    # https://host/ is stored at host/index/index.html, so relative refs like images/foo.gif
+    # resolve incorrectly after export unless we fix them here.
+    def _fix_bare_attr(m):
+        attr  = m.group(1)
+        rpath = m.group(2)
+        quote = m.group(3)
+        if not rpath or rpath[0] in ('.', '/', '#'):
+            return m.group(0)
+        if re.match(r'^[a-zA-Z][a-zA-Z0-9+\-.]*:', rpath):  # scheme (http:, data:, mailto:…)
+            return m.group(0)
+        abs_url = urljoin(page_url, rpath)
+        for variant in (abs_url, unquote(abs_url)):
+            if variant in url_map:
+                return attr + _rel_path(url_map[variant], dest_root, page_dest) + quote
+        return m.group(0)
+
+    text = re.sub(
+        r'((?:src|href|action|data-src|poster|data-lazy|data-original|data-bg|data-background)'
+        r'\s*=\s*["\'])([^"\'>\s]+)(["\'])',
+        _fix_bare_attr, text, flags=re.IGNORECASE)
+
+    # Bare relative url() — same logic as above for inline styles / style blocks
+    def _fix_bare_url(m):
+        rpath = m.group(1)
+        if not rpath or rpath[0] in ('.', '/', '#'):
+            return m.group(0)
+        if re.match(r'^[a-zA-Z][a-zA-Z0-9+\-.]*:', rpath):
+            return m.group(0)
+        abs_url = urljoin(page_url, rpath)
+        for variant in (abs_url, unquote(abs_url)):
+            if variant in url_map:
+                return 'url("' + _rel_path(url_map[variant], dest_root, page_dest) + '")'
+        return m.group(0)
+
+    text = re.sub(r'url\(["\']?([^"\'()\s]+)["\']?\)', _fix_bare_url, text, flags=re.IGNORECASE)
+
     # Update charset declaration to utf-8
     text = re.sub(r'charset\s*=\s*[\w-]+', 'charset=utf-8', text, flags=re.IGNORECASE)
     return text.encode("utf-8")
