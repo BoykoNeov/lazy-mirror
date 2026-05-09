@@ -102,7 +102,15 @@ _state_lock         = threading.Lock()
 #  State
 # ═══════════════════════════════════════════════════════════════════════════════
 
+_state_cache: dict = {}
+_state_cache_ts: float = 0.0
+_STATE_TTL = 1.0
+
 def load_state() -> dict:
+    global _state_cache, _state_cache_ts
+    now = time.monotonic()
+    if _state_cache and (now - _state_cache_ts) < _STATE_TTL:
+        return dict(_state_cache)
     defaults = {
         # Proxy mode
         "offline_mode":      False,
@@ -128,7 +136,9 @@ def load_state() -> dict:
             defaults.update(saved)
         except Exception:
             pass
-    return defaults
+    _state_cache = defaults
+    _state_cache_ts = now
+    return dict(defaults)
 
 def save_state(s: dict):
     with _state_lock:
@@ -136,12 +146,14 @@ def save_state(s: dict):
 
 def _patch_state(**kw):
     """Update only specific keys in state — never overwrites unrelated keys."""
+    global _state_cache_ts
     with _state_lock:
         # Re-read inside lock to get freshest version, then merge
         s = load_state()
         s.update(kw)
         # Write directly (bypass save_state to avoid double-lock)
         STATE_FILE.write_text(json.dumps(s, indent=2, ensure_ascii=False), "utf-8")
+        _state_cache_ts = 0.0
 
 # ── Meta ──────────────────────────────────────────────────────────────────────
 def load_meta() -> dict:
@@ -200,7 +212,13 @@ def url_to_path(url: str) -> Path:
         qh = hashlib.md5(p.query.encode()).hexdigest()[:8]
         base, ext = os.path.splitext(safe)
         safe = f"{base}__q{qh}{ext}"
-    return CACHE_DIR / p.netloc / safe
+    result = CACHE_DIR / p.netloc / safe
+    if len(str(result)) > 240:
+        h = hashlib.md5(safe.encode()).hexdigest()[:16]
+        ext = Path(safe).suffix or ""
+        safe = f"_long/{h}{ext}"
+        result = CACHE_DIR / p.netloc / safe
+    return result
 
 def sidecar_path(p: Path) -> Path:
     return p.with_suffix(p.suffix + ".meta.json")
@@ -248,13 +266,14 @@ def write_cache(url: str, status: int, ct_full: str, body: bytes):
     }, ensure_ascii=False), "utf-8")
     with _meta_lock:
         meta = load_meta()
+        old_size = meta["cached_urls"].get(url, {}).get("size", 0)
         meta["cached_urls"][url] = {
             "path": str(path.relative_to(CACHE_DIR)),
             "content_type": ct_mime, "size": len(body),
             "cached_at": datetime.now(timezone.utc).isoformat(),
         }
         meta["stats"]["total"] = len(meta["cached_urls"])
-        meta["stats"]["bytes"] = sum(v.get("size",0) for v in meta["cached_urls"].values())
+        meta["stats"]["bytes"] = meta["stats"].get("bytes", 0) - old_size + len(body)
         save_meta(meta)
     clear_failure(url)
     log.info("CACHED [%d] %s  (%s  %d B)", status, url, ct_mime, len(body))
@@ -655,7 +674,14 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
        "Chrome/124.0.0.0 Safari/537.36")
 
 
-def _write_queue_file():
+_last_queue_flush = 0.0
+
+def _write_queue_file(force: bool = False):
+    global _last_queue_flush
+    now = time.monotonic()
+    if not force and (now - _last_queue_flush < 2.0):
+        return
+    _last_queue_flush = now
     try:
         items = _fetch_queue.snapshot()
         QUEUE_FILE.write_text(json.dumps(
@@ -694,7 +720,7 @@ def _worker_loop():
             item = _fetch_queue.get(timeout=1)
         except _queue_mod.Empty:
             _patch_state(queue_depth=_fetch_queue.qsize())
-            _write_queue_file()
+            _write_queue_file(force=True)
             continue
 
         if item is None:

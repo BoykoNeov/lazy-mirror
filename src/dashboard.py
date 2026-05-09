@@ -24,11 +24,24 @@ QUEUE_FILE  = CACHE_DIR / "_queue.json"
 
 app = Flask(__name__)
 
+_meta_cache: dict = {}
+_meta_cache_ts: float = 0.0
+_META_TTL = 3.0
+
 def load_meta():
+    global _meta_cache, _meta_cache_ts
+    now = _time_mod.monotonic()
+    if _meta_cache and (now - _meta_cache_ts) < _META_TTL:
+        return dict(_meta_cache)
     if META_FILE.exists():
-        try: return json.loads(META_FILE.read_text("utf-8"))
+        try:
+            _meta_cache = json.loads(META_FILE.read_text("utf-8"))
+            _meta_cache_ts = now
+            return dict(_meta_cache)
         except Exception: pass
-    return {"cached_urls": {}, "stats": {"total": 0, "bytes": 0}}
+    _meta_cache = {"cached_urls": {}, "stats": {"total": 0, "bytes": 0}}
+    _meta_cache_ts = now
+    return dict(_meta_cache)
 
 def load_state():
     defaults = {
@@ -71,7 +84,13 @@ def url_to_path(url):
         qh = hashlib.md5(p.query.encode()).hexdigest()[:8]
         base, ext = os.path.splitext(safe)
         safe = f"{base}__q{qh}{ext}"
-    return CACHE_DIR / p.netloc / safe
+    result = CACHE_DIR / p.netloc / safe
+    if len(str(result)) > 240:
+        h = hashlib.md5(safe.encode()).hexdigest()[:16]
+        ext = Path(safe).suffix or ""
+        safe = f"_long/{h}{ext}"
+        result = CACHE_DIR / p.netloc / safe
+    return result
 
 # ─────────────────────────────────────────────────────────────────────────────
 DASHBOARD_HTML = r"""<!DOCTYPE html>
@@ -545,8 +564,8 @@ async function load(){
   // Stats
   document.getElementById('sTotal').textContent = cache.stats.total.toLocaleString();
   document.getElementById('sSize').textContent  = fmtB(cache.stats.bytes);
-  const hosts=[...new Set(entries.map(e=>{try{return new URL(e.url).hostname}catch{return ''}}).filter(Boolean))];
-  document.getElementById('sHosts').textContent = hosts.length;
+  const hostsData = cache.hosts || {};
+  document.getElementById('sHosts').textContent = Object.keys(hostsData).length;
   document.getElementById('sPages').textContent = entries.filter(e=>e.content_type&&e.content_type.includes('html')).length;
   document.getElementById('sQueue').textContent = queueEntries.length||'—';
   document.getElementById('sFailed').textContent= failedEntries.length||'—';
@@ -554,17 +573,15 @@ async function load(){
   document.getElementById('failBadge').textContent  = failedEntries.length?`(${failedEntries.length})`:'';
 
   // Sidebar
-  document.getElementById('cntAll').textContent = entries.length;
+  document.getElementById('cntAll').textContent = cache.stats.total.toLocaleString();
   const ul=document.getElementById('hostList');
   [...ul.querySelectorAll('[data-host]:not([data-host=""])')].forEach(el=>el.remove());
-  const hc={}, hs={};
-  entries.forEach(e=>{try{const h=new URL(e.url).hostname;hc[h]=(hc[h]||0)+1;hs[h]=(hs[h]||0)+(e.size||0)}catch{}});
-  Object.entries(hc).sort().forEach(([h,c])=>{
+  Object.entries(hostsData).sort().forEach(([h, data])=>{
     const li=document.createElement('li'); li.dataset.host=h;
     li.onclick=function(){filterHost(h,this)};
     if(activeHost===h) li.classList.add('active');
     li.innerHTML=`<span class="host-name" title="${h}">${h}</span>
-      <div class="host-meta"><span class="cnt">${c}</span><span class="host-sz">${fmtB(hs[h]||0)}</span></div>`;
+      <div class="host-meta"><span class="cnt">${data.count}</span><span class="host-sz">${fmtB(data.bytes||0)}</span></div>`;
     ul.appendChild(li);
   });
 
@@ -1047,9 +1064,27 @@ def index(): return DASHBOARD_HTML
 
 @app.route("/api/cache")
 def api_cache():
-    meta = load_meta()
-    entries = [{"url": url, **info} for url, info in meta.get("cached_urls", {}).items()]
-    return jsonify({"entries": entries, "stats": meta.get("stats", {"total": 0, "bytes": 0})})
+    meta  = load_meta()
+    raw   = meta.get("cached_urls", {})
+    stats = meta.get("stats", {"total": 0, "bytes": 0})
+    hc, hs = {}, {}
+    for url, info in raw.items():
+        try:
+            h = urlparse(url).hostname or ""
+            if h:
+                hc[h] = hc.get(h, 0) + 1
+                hs[h] = hs.get(h, 0) + info.get("size", 0)
+        except Exception: pass
+    hosts = {h: {"count": hc[h], "bytes": hs[h]} for h in hc}
+    q    = request.args.get("q", "").strip().lower()
+    host = request.args.get("host", "").strip()
+    entries = [{"url": url, **info} for url, info in raw.items()]
+    if q:    entries = [e for e in entries if q in e["url"].lower()]
+    if host: entries = [e for e in entries if urlparse(e["url"]).hostname == host]
+    entries.sort(key=lambda e: e.get("cached_at", ""), reverse=True)
+    total_filtered = len(entries)
+    entries = entries[:500]
+    return jsonify({"entries": entries, "total_filtered": total_filtered, "stats": stats, "hosts": hosts})
 
 @app.route("/api/mode")
 def api_mode(): return jsonify(load_state())
@@ -1104,6 +1139,7 @@ def api_settings():
 
 @app.route("/api/delete", methods=["POST"])
 def api_delete():
+    global _meta_cache_ts
     url = (request.get_json() or {}).get("url", "")
     if not url: return abort(400)
     meta = load_meta()
@@ -1117,6 +1153,7 @@ def api_delete():
         meta["stats"]["total"] = len(meta["cached_urls"])
         meta["stats"]["bytes"] = sum(v.get("size",0) for v in meta["cached_urls"].values())
         META_FILE.write_text(json.dumps(meta, indent=2), "utf-8")
+        _meta_cache_ts = 0.0
     return jsonify({"ok": True})
 
 @app.route("/api/queue-clear", methods=["POST"])
@@ -1260,7 +1297,8 @@ def _rel_path(target_cache_path: str, dest_root: Path, page_dest: Path) -> str:
 
 
 def _rewrite_html(raw: bytes, page_url: str, url_map: dict,
-                  dest_root: Path, page_dest: Path, sidecar: Path) -> bytes:
+                  dest_root: Path, page_dest: Path, sidecar: Path,
+                  url_pattern=None) -> bytes:
     """
     Rewrite HTML for export so all URLs point to local files.
 
@@ -1283,10 +1321,14 @@ def _rewrite_html(raw: bytes, page_url: str, url_map: dict,
 
     text = _smart_decode(raw, sidecar)
 
-    # Sort longest-first to avoid partial replacements
-    for url in sorted(url_map, key=len, reverse=True):
-        if url in text:
-            text = text.replace(url, _rel_path(url_map[url], dest_root, page_dest))
+    # Single-pass replacement of all absolute URLs using pre-compiled pattern
+    if url_pattern:
+        text = url_pattern.sub(
+            lambda m: _rel_path(url_map[m.group(0)], dest_root, page_dest), text)
+    else:
+        for url in sorted(url_map, key=len, reverse=True):
+            if url in text:
+                text = text.replace(url, _rel_path(url_map[url], dest_root, page_dest))
 
     # Root-relative /path in attributes
     def _fix_root_attr(m):
@@ -1359,7 +1401,8 @@ def _rewrite_html(raw: bytes, page_url: str, url_map: dict,
 
 
 def _rewrite_css(raw: bytes, page_url: str, url_map: dict,
-                 dest_root: Path, page_dest: Path, sidecar: Path) -> bytes:
+                 dest_root: Path, page_dest: Path, sidecar: Path,
+                 url_pattern=None) -> bytes:
     """Rewrite CSS for export — same logic as HTML but for url() and @import."""
     from urllib.parse import unquote
     parsed     = urlparse(page_url)
@@ -1368,9 +1411,13 @@ def _rewrite_css(raw: bytes, page_url: str, url_map: dict,
 
     text = _smart_decode(raw, sidecar)
 
-    for url in sorted(url_map, key=len, reverse=True):
-        if url in text:
-            text = text.replace(url, _rel_path(url_map[url], dest_root, page_dest))
+    if url_pattern:
+        text = url_pattern.sub(
+            lambda m: _rel_path(url_map[m.group(0)], dest_root, page_dest), text)
+    else:
+        for url in sorted(url_map, key=len, reverse=True):
+            if url in text:
+                text = text.replace(url, _rel_path(url_map[url], dest_root, page_dest))
 
     def _fix_root(m):
         rpath = m.group(1)
@@ -1400,6 +1447,9 @@ def api_export():
     meta    = load_meta()
     entries = meta.get("cached_urls", {})
     url_map = _build_url_map(entries)
+    url_pattern = re.compile(
+        '|'.join(re.escape(u) for u in sorted(url_map, key=len, reverse=True))
+    ) if url_map else None
     count   = 0
 
     for url, info in entries.items():
@@ -1413,9 +1463,9 @@ def api_export():
         try:
             raw = src.read_bytes()
             if "html" in ct or "xhtml" in ct:
-                raw = _rewrite_html(raw, url, url_map, dest_path, out, sc)
+                raw = _rewrite_html(raw, url, url_map, dest_path, out, sc, url_pattern)
             elif "css" in ct:
-                raw = _rewrite_css(raw, url, url_map, dest_path, out, sc)
+                raw = _rewrite_css(raw, url, url_map, dest_path, out, sc, url_pattern)
             out.write_bytes(raw)
         except Exception:
             shutil.copy2(src, out)
