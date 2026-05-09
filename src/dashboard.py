@@ -24,6 +24,9 @@ QUEUE_FILE  = CACHE_DIR / "_queue.json"
 
 app = Flask(__name__)
 
+# Cache for _meta.json — avoids a disk read on every 3-second poll cycle.
+# TTL matches the poll interval so each cycle reads from cache rather than disk.
+# Invalidated immediately by api_delete() so deletions are reflected in the next poll.
 _meta_cache: dict = {}
 _meta_cache_ts: float = 0.0
 _META_TTL = 3.0
@@ -68,6 +71,8 @@ def load_failed():
     return {}
 
 def load_queue():
+    # _queue.json is a snapshot written by the proxy worker (throttled ~2 s).
+    # It can lag the in-memory queue slightly — used for display only, not for decisions.
     if QUEUE_FILE.exists():
         try: return json.loads(QUEUE_FILE.read_text("utf-8"))
         except Exception: pass
@@ -1067,6 +1072,9 @@ def api_cache():
     meta  = load_meta()
     raw   = meta.get("cached_urls", {})
     stats = meta.get("stats", {"total": 0, "bytes": 0})
+
+    # Compute per-host counts/bytes over ALL entries before filtering so the
+    # sidebar always shows correct domain totals regardless of the active filter.
     hc, hs = {}, {}
     for url, info in raw.items():
         try:
@@ -1076,6 +1084,7 @@ def api_cache():
                 hs[h] = hs.get(h, 0) + info.get("size", 0)
         except Exception: pass
     hosts = {h: {"count": hc[h], "bytes": hs[h]} for h in hc}
+
     q    = request.args.get("q", "").strip().lower()
     host = request.args.get("host", "").strip()
     entries = [{"url": url, **info} for url, info in raw.items()]
@@ -1083,6 +1092,8 @@ def api_cache():
     if host: entries = [e for e in entries if urlparse(e["url"]).hostname == host]
     entries.sort(key=lambda e: e.get("cached_at", ""), reverse=True)
     total_filtered = len(entries)
+    # Cap serialised payload — sending 10 k+ entries to the browser on every 3-s poll
+    # would cause noticeable jank; total_filtered lets the UI show the real count.
     entries = entries[:500]
     return jsonify({"entries": entries, "total_filtered": total_filtered, "stats": stats, "hosts": hosts})
 
@@ -1158,6 +1169,8 @@ def api_delete():
 
 @app.route("/api/queue-clear", methods=["POST"])
 def api_queue_clear():
+    # Signal file triggers the proxy's in-memory queue.clear() on its next request hook.
+    # Writing [] to QUEUE_FILE is an optimistic update so the UI shows 0 immediately.
     (CACHE_DIR / "_queue_clear").write_text("1", "utf-8")
     QUEUE_FILE.write_text("[]", "utf-8")
     return jsonify({"ok": True})
@@ -1186,6 +1199,9 @@ def api_queue_remove():
 
 @app.route("/api/refetch", methods=["POST"])
 def api_refetch():
+    # The proxy queue lives in its own process — we can't call it directly.
+    # Drop a signal file in _refetch/ that the proxy reads during its next request hook
+    # and re-queues with force=True (bypassing the is_cached() guard).
     url = (request.get_json() or {}).get("url", "")
     if not url: return abort(400)
     rf_dir = CACHE_DIR / "_refetch"; rf_dir.mkdir(exist_ok=True)
@@ -1227,6 +1243,9 @@ _META_CHARSET_RE2 = re.compile(r'<meta[^>]+charset\s*=\s*["\']?\s*([\w-]+)', re.
 _META_CT_RE2      = re.compile(r'<meta[^>]+content\s*=\s*["\'][^"\']*charset=([\w-]+)', re.I)
 
 def _detect_charset_dash(raw: bytes, ct_header: str = "") -> str:
+    # Intentional duplicate of proxy_addon._detect_charset.  The dashboard is a
+    # separate process and cannot import proxy_addon (mitmproxy is not importable
+    # stand-alone), so the charset detection logic must live here too.
     if "charset=" in ct_header.lower():
         m = re.search(r'charset=([\w-]+)', ct_header, re.I)
         if m: return m.group(1).strip()
@@ -1275,7 +1294,8 @@ def _build_url_map(entries: dict) -> dict:
         decoded = unquote(url)
         if decoded != url:
             url_map[decoded] = path          # decoded form:  https://.../Images Landkarten/file.jpg
-        # Also add http:// variant
+        # Also map the http:// variant — some pages link to the same resource
+        # with a mixed scheme (e.g. stylesheet via http:// on an https:// page).
         if url.startswith("https://"):
             http = "http://" + url[8:]
             url_map[http] = path
@@ -1292,6 +1312,8 @@ def _rel_path(target_cache_path: str, dest_root: Path, page_dest: Path) -> str:
     Returns forward-slash path for HTML/CSS.
     """
     target_abs = dest_root / target_cache_path.replace("\\", "/")
+    # PurePosixPath.relative_to() would raise if target is outside page's tree;
+    # os.path.relpath handles cross-subtree cases correctly (e.g. ../images/foo.png).
     rel = _os.path.relpath(str(target_abs), str(page_dest.parent))
     return rel.replace("\\", "/")
 
@@ -1447,6 +1469,9 @@ def api_export():
     meta    = load_meta()
     entries = meta.get("cached_urls", {})
     url_map = _build_url_map(entries)
+    # Compile all cached URLs into a single alternation regex (longest first to avoid
+    # partial matches) — makes absolute-URL replacement O(n) per file instead of O(n×m),
+    # which is critical when exporting caches with thousands of unique URLs.
     url_pattern = re.compile(
         '|'.join(re.escape(u) for u in sorted(url_map, key=len, reverse=True))
     ) if url_map else None
@@ -1490,7 +1515,11 @@ def api_export():
 # ── Cache browser ─────────────────────────────────────────────────────────────
 # http://127.0.0.1:7780/<hostname>/path
 # Example: http://127.0.0.1:7780/www.himalaya-info.org/index.htm
-
+#
+# A separate Flask app on port 7780 so it can use a different URL scheme from
+# the management dashboard.  All absolute URLs in served HTML/CSS are rewritten
+# to /<hostname>/path so the browser resolves them back through this same app,
+# regardless of the original domain.
 browser_app = Flask("cache_browser")
 
 def _ct_for(path: Path, sidecar: Path) -> str:
@@ -1528,6 +1557,8 @@ def _try_cache(host: str, subpath: str, query: str = ""):
     under the `?q=…` form are matched via their stable __q<hash> filename.
     """
     from urllib.parse import unquote
+    # Build candidate sub-paths to try.  Directories are stored as <path>/index.html
+    # by url_to_path(), so a browser request for /foo/ must check /foo/index.html too.
     candidates = []
     if not subpath or subpath.endswith("/"):
         base = subpath.rstrip("/")

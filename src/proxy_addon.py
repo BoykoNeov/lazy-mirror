@@ -86,22 +86,32 @@ ALL_CACHE_MIMES = (IMAGE_MIMES | FONT_MIMES | MEDIA_MIMES |
                    CSS_MIMES | JS_MIMES | HTML_MIMES | MISC_MIMES)
 
 # ── SSL ───────────────────────────────────────────────────────────────────────
+# Cert verification is disabled for background worker fetches only.
+# The browser already verified the server cert through mitmproxy's normal HTTPS flow;
+# the worker fetches assets directly (not through the proxy) so it would see the real
+# server cert, which may differ from what the site presents (CDN, load balancer, etc.).
 _ssl_ctx = ssl.create_default_context()
 _ssl_ctx.check_hostname = False
 _ssl_ctx.verify_mode    = ssl.CERT_NONE
 
-# ── Locks ─────────────────────────────────────────────────────────────────────
+# ── Locks / in-flight tracking ────────────────────────────────────────────────
+# _inflight tracks URLs currently being fetched by the worker thread.  Checked
+# (under _inflight_lock) before enqueuing so we never double-queue the same URL.
 _inflight:     set = set()
-_inflight_lock      = threading.Lock()
-_meta_lock          = threading.Lock()
-_failed_lock        = threading.Lock()
-_state_lock         = threading.Lock()
+_inflight_lock      = threading.Lock()   # guards _inflight
+_meta_lock          = threading.Lock()   # guards _meta.json reads+writes inside write_cache
+_failed_lock        = threading.Lock()   # guards _failed.json reads+writes
+_state_lock         = threading.Lock()   # guards _state.json writes in _patch_state / save_state
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  State
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# In-process cache for _state.json — the worker calls load_state() on every
+# URL it schedules (_sync_pause_from_state, is_blocked, filter_assets…),
+# making it a very hot path.  1-second TTL is safe: _patch_state() always
+# resets _state_cache_ts to 0, so any write is visible within one TTL window.
 _state_cache: dict = {}
 _state_cache_ts: float = 0.0
 _STATE_TTL = 1.0
@@ -138,7 +148,7 @@ def load_state() -> dict:
             pass
     _state_cache = defaults
     _state_cache_ts = now
-    return dict(defaults)
+    return dict(defaults)   # return a copy so callers cannot mutate the shared cache dict
 
 def save_state(s: dict):
     with _state_lock:
@@ -221,6 +231,8 @@ def url_to_path(url: str) -> Path:
     return result
 
 def sidecar_path(p: Path) -> Path:
+    # Each cached file has a companion ".meta.json" that stores content_type,
+    # HTTP status, size, and cached_at — used by the cache browser and offline mode.
     return p.with_suffix(p.suffix + ".meta.json")
 
 def is_cached(url: str) -> bool:
@@ -229,6 +241,7 @@ def is_cached(url: str) -> bool:
 def should_cache_ct(ct: str) -> bool:
     ct = ct.split(";")[0].strip().lower()
     return (ct in ALL_CACHE_MIMES or
+            # Catch vendor/non-standard subtypes not in ALL_CACHE_MIMES (e.g. image/x-png, font/x-woff)
             ct.split("/")[0] in {"image","font","audio","video"})
 
 def is_blocked(url: str) -> bool:
@@ -244,6 +257,7 @@ def is_same_host(url: str, origin: str) -> bool:
     except Exception: return False
 
 def is_page_url(url: str) -> bool:
+    # Empty string ("") is in PAGE_EXTS to cover paths ending in "/" which have no file extension
     return Path(urlparse(url).path).suffix.lower() in PAGE_EXTS
 
 def ext_of(url: str) -> str:
@@ -266,6 +280,7 @@ def write_cache(url: str, status: int, ct_full: str, body: bytes):
     }, ensure_ascii=False), "utf-8")
     with _meta_lock:
         meta = load_meta()
+        # Capture old size before overwriting — non-zero when a URL is re-fetched
         old_size = meta["cached_urls"].get(url, {}).get("size", 0)
         meta["cached_urls"][url] = {
             "path": str(path.relative_to(CACHE_DIR)),
@@ -273,12 +288,15 @@ def write_cache(url: str, status: int, ct_full: str, body: bytes):
             "cached_at": datetime.now(timezone.utc).isoformat(),
         }
         meta["stats"]["total"] = len(meta["cached_urls"])
+        # O(1) incremental update — avoids summing every entry on each cache write
         meta["stats"]["bytes"] = meta["stats"].get("bytes", 0) - old_size + len(body)
         save_meta(meta)
     clear_failure(url)
     log.info("CACHED [%d] %s  (%s  %d B)", status, url, ct_mime, len(body))
 
 # ── URL helpers ───────────────────────────────────────────────────────────────
+# URL prefixes that are not fetchable HTTP resources — bail out early in norm()
+# rather than letting urlparse / urljoin try to make sense of them.
 _SKIP_STARTS = ("data:","blob:","javascript:","#","mailto:","tel:",
                 "about:","chrome:","chrome-extension:")
 
@@ -311,7 +329,7 @@ def norm(raw: str, base: str):
         abs_url = urljoin(base, raw)
         p = urlparse(abs_url)
         if p.scheme not in ("http","https"): return None
-        clean = urlunparse(p._replace(fragment=""))
+        clean = urlunparse(p._replace(fragment=""))   # strip fragment — servers never receive it
         return sanitize_url(clean)
     except Exception:
         return None
@@ -401,6 +419,8 @@ _EMBED_ATTRS = (
     "data-poster","data-lazyload","data-lazy-src","data-echo","poster",
 )
 _EMBED_RE = re.compile(
+    # Longest attribute name first so "data-lazy-src" is matched before "data-lazy";
+    # without this, the shorter name would swallow the beginning and leave "src" unmatched.
     r"\b(" + "|".join(re.escape(a) for a in sorted(_EMBED_ATTRS, key=len, reverse=True)) +
     r")\s*=\s*(?:\"([^\"]*)\"|'([^']*)')", re.I)
 
@@ -572,6 +592,8 @@ def harvest_html(html_bytes: bytes, base_url: str, ct_header: str = "") -> Harve
         if u: result.other.add(u)
 
     # ── 13. Implicit /favicon.ico ─────────────────────────────────────────────
+    # Browsers always request /favicon.ico even when it's absent from the HTML;
+    # pre-emptively queue it so the offline copy doesn't generate a 404.
     p = urlparse(base_url)
     result.other.add(urlunparse(p._replace(path="/favicon.ico", query="", fragment="")))
 
@@ -605,7 +627,7 @@ def filter_assets(result: HarvestResult, state: dict) -> set:
     if state.get("fetch_css_js",  True):  urls |= result.css | result.js
     if state.get("fetch_fonts",   True):  urls |= result.fonts
     if state.get("fetch_media",   True):  urls |= result.media
-    urls |= result.other   # favicons, manifests — always (tiny)
+    urls |= result.other   # favicons, manifests — no toggle; always fetched (tiny payloads, always needed for page rendering)
 
     # Linked files via <a href>
     if state.get("fetch_linked_files", False):
@@ -622,6 +644,13 @@ def filter_assets(result: HarvestResult, state: dict) -> set:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class InspectableQueue:
+    """Thread-safe FIFO with snapshot(), remove_url(), and clear().
+
+    stdlib queue.Queue provides none of these — they are needed so the
+    dashboard can display live queue contents and honour remove/clear signals
+    from the dashboard without stopping the worker.  A Condition variable is
+    used so get() blocks without busy-waiting.
+    """
     def __init__(self):
         self._items: list = []
         self._cv = threading.Condition(threading.Lock())
@@ -665,15 +694,18 @@ class InspectableQueue:
 
 _fetch_queue    = InspectableQueue()
 _worker_started = False
-_worker_lock    = threading.Lock()
+_worker_lock    = threading.Lock()   # guards the one-time worker thread start
 _pause_event    = threading.Event()
-_pause_event.set()
+_pause_event.set()   # set = running (not paused); clear = paused
 
+# Spoof a real browser UA — many CDNs and image hosts block Python's default "Python-urllib/3.x"
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
        "AppleWebKit/537.36 (KHTML, like Gecko) "
        "Chrome/124.0.0.0 Safari/537.36")
 
 
+# Timestamp of last _queue.json write — throttled to avoid a flood of disk writes
+# during burst fetches (e.g. 200 assets harvested from one page).
 _last_queue_flush = 0.0
 
 def _write_queue_file(force: bool = False):
@@ -723,7 +755,7 @@ def _worker_loop():
             _write_queue_file(force=True)
             continue
 
-        if item is None:
+        if item is None:   # poison-pill sentinel — reserved for clean shutdown (not currently used)
             break
 
         url, referer, force, depth, origin_host = item
@@ -733,11 +765,11 @@ def _worker_loop():
             log.debug("Worker error %s: %s", url, e)
         finally:
             _patch_state(queue_depth=_fetch_queue.qsize())
-            _write_queue_file()
+            _write_queue_file()   # throttled — no-ops unless 2 s have elapsed since last flush
 
         delay_ms = load_state().get("fetch_delay_ms", 0) or 0
         if delay_ms > 0:
-            jitter = delay_ms * 0.2 * (random.random() * 2 - 1)
+            jitter = delay_ms * 0.2 * (random.random() * 2 - 1)   # ±20% avoids a predictable request cadence
             time.sleep(max(0, (delay_ms + jitter) / 1000.0))
 
 
@@ -763,7 +795,7 @@ def _do_fetch(url: str, referer: str, force: bool, depth: int, origin_host: str)
             "Referer":         referer,
             "Accept":          "image/avif,image/webp,image/apng,image/*,text/css,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "identity",
+            "Accept-Encoding": "identity",   # disable gzip/br — we cache the raw bytes as-is
         })
         with urllib.request.urlopen(req, context=_ssl_ctx, timeout=25) as resp:
             body      = resp.read()
@@ -839,6 +871,8 @@ def _schedule_one(url: str, referer: str, depth: int,
     with _inflight_lock:
         if not force and (url in _inflight or is_cached(url)):
             return
+        # Add to _inflight before releasing the lock so a second concurrent caller
+        # sees it as taken — prevents duplicate queue entries for the same URL.
         _inflight.add(url)
     _ensure_worker()
     _fetch_queue.put((url, referer, force, depth, origin_host))
@@ -846,6 +880,8 @@ def _schedule_one(url: str, referer: str, depth: int,
 
 def _schedule_batch(urls: set, referer: str, depth: int,
                     origin_host: str, force: bool = False):
+    # Acquires _inflight_lock once for the whole set — much cheaper than calling
+    # _schedule_one() in a loop when harvesting 50+ assets from a single page.
     to_add = []
     with _inflight_lock:
         for url in urls:
@@ -865,6 +901,8 @@ def _schedule_batch(urls: set, referer: str, depth: int,
 # ── Public API (called from dashboard) ───────────────────────────────────────
 
 def refetch_url(url: str):
+    # force=True bypasses the is_cached() check so the URL is re-fetched
+    # even when its file already exists on disk.
     with _inflight_lock:
         if url in _inflight: return
         _inflight.add(url)
