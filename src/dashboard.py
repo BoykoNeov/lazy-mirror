@@ -1506,7 +1506,7 @@ def api_export():
         "<p>Click any page below to browse the offline archive.</p><ul>",
     ]
     for url, info in sorted(pages, key=lambda x: x[0]):
-        idx.append(f'<li><a href="{info.get("path","")}">{url}</a></li>')
+        idx.append(f'<li><a href="{info.get("path","").replace(chr(92), "/")}">{url}</a></li>')
     idx += ["</ul></body></html>"]
     (dest_path / "index.html").write_text("\n".join(idx), "utf-8")
     return jsonify({"ok": True, "count": count, "dest": str(dest_path)})
