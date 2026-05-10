@@ -187,6 +187,19 @@ def _write_queue_depth(n: int):
     except Exception:
         pass
 
+# ── Atomic JSON write helper ───────────────────────────────────────────────────
+def _atomic_write_json(path: Path, data: dict):
+    """Write JSON to a temp file then rename it over the target.
+
+    write_text() is not atomic: a crash or kill mid-write leaves a partial
+    (invalid JSON) file.  write-then-rename is atomic on the same filesystem on
+    both Windows and Linux, so the target is either the old version or the new
+    version — never a corrupt in-between state.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), "utf-8")
+    os.replace(tmp, path)   # os.replace is atomic on the same filesystem
+
 # ── Meta ──────────────────────────────────────────────────────────────────────
 def load_meta() -> dict:
     if META_FILE.exists():
@@ -195,7 +208,8 @@ def load_meta() -> dict:
     return {"cached_urls": {}, "stats": {"total": 0, "bytes": 0}}
 
 def save_meta(m: dict):
-    META_FILE.write_text(json.dumps(m, indent=2, ensure_ascii=False), "utf-8")
+    # Atomic write prevents a mid-write crash from corrupting the index.
+    _atomic_write_json(META_FILE, m)
 
 def load_failed() -> dict:
     if FAILED_FILE.exists():
@@ -1120,8 +1134,79 @@ class LazyMirrorAddon:
             log.warning("Harvest error %s: %s", url, e)
 
 
-# Re-populate the in-memory queue from any items the previous session left behind.
-# Placed here so all functions (_ensure_worker, _worker_loop, etc.) are defined first.
+def rebuild_meta_from_sidecars() -> int:
+    """Rebuild _meta.json by reading all sidecar .meta.json files in the cache.
+
+    Each cached file has a companion <filename>.meta.json written atomically by
+    write_cache().  This function walks all of them to reconstruct the central
+    index if it was lost or corrupted.  Returns the number of entries rebuilt.
+
+    Called automatically at startup when _check_meta_integrity() detects a gap,
+    and exposed as a public function so dashboard.py can offer a manual trigger.
+    """
+    cached_urls: dict = {}
+    total_bytes: int  = 0
+
+    for sidecar in CACHE_DIR.rglob("*.meta.json"):
+        name = sidecar.name
+        if not name.endswith(".meta.json"):
+            continue
+        content_name = name[: -len(".meta.json")]   # strip the '.meta.json' suffix
+        try:
+            data = json.loads(sidecar.read_text("utf-8"))
+            url  = data.get("url")
+            if not url:
+                continue
+            size = data.get("size", 0)
+            rel  = str((sidecar.parent / content_name).relative_to(CACHE_DIR))
+            cached_urls[url] = {
+                "path":         rel,
+                "content_type": data.get("content_type", "application/octet-stream"),
+                "size":         size,
+                "cached_at":    data.get("cached_at", ""),
+            }
+            total_bytes += size
+        except Exception:
+            pass
+
+    with _meta_lock:
+        save_meta({"cached_urls": cached_urls,
+                   "stats": {"total": len(cached_urls), "bytes": total_bytes}})
+    return len(cached_urls)
+
+
+def _check_meta_integrity():
+    """Auto-heal _meta.json on startup if it is severely incomplete.
+
+    A non-atomic write_text() crash can leave _meta.json empty or corrupt,
+    causing load_meta() to return an empty dict.  Subsequent browsing then
+    builds a fresh index from scratch, making all previously cached files
+    invisible in the dashboard.
+
+    Fix: count sidecar files (fast glob, no reads) and compare against the
+    index.  If the gap is large, rebuild before the addon starts serving.
+    """
+    meta       = load_meta()
+    meta_count = len(meta.get("cached_urls", {}))
+
+    # Fast sidecar count — just glob, no file reads
+    sidecar_count = sum(1 for _ in CACHE_DIR.rglob("*.meta.json"))
+
+    # Rebuild if the index has < 50% of what the sidecars cover AND the gap is
+    # at least 10 files (avoids noise on fresh installs with 0–1 cached items)
+    if sidecar_count > 10 and meta_count < sidecar_count * 0.5:
+        log.info(
+            "[LazyMirror] Meta index incomplete (%d entries vs %d sidecars) — rebuilding",
+            meta_count, sidecar_count,
+        )
+        count = rebuild_meta_from_sidecars()
+        log.info("[LazyMirror] Meta index rebuilt: %d entries", count)
+
+
+# ── Module-level startup calls (must stay at end — all functions must be defined) ──
+# Run integrity check before queue restore so the dashboard sees a correct count
+# from the very first poll after startup.
+_check_meta_integrity()
 _restore_queue_from_file()
 
 addons = [LazyMirrorAddon()]

@@ -62,8 +62,14 @@ def load_state():
         except Exception: pass
     return defaults
 
+def _atomic_write_json(path, data):
+    """Write-then-rename to prevent partial writes from corrupting JSON files."""
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), "utf-8")
+    os.replace(tmp, path)
+
 def save_state(s):
-    STATE_FILE.write_text(json.dumps(s, indent=2), "utf-8")
+    _atomic_write_json(STATE_FILE, s)
 
 def load_failed():
     if FAILED_FILE.exists():
@@ -519,6 +525,8 @@ tr:hover td{background:#13161e}
         <!-- Delete every cached file for the active host — bypasses the 500-item UI cap -->
         <button class="btn danger" id="delHostBtn" onclick="deleteAllFromHost()" style="display:none"></button>
         <button class="btn" id="deselectAllBtn" onclick="clearCacheSelection()" style="display:none">Deselect all</button>
+        <!-- Rebuild index from sidecar files — repairs a corrupted or incomplete _meta.json -->
+        <button class="btn" onclick="rebuildIndex()" title="Rebuild the cache index from sidecar files on disk — repairs missing entries caused by a crash">Rebuild Index</button>
       </div>
       <!-- Top bar: page-size selector, sort-scope toggle, entry count -->
       <div class="pg-bar" id="cachePgTop"></div>
@@ -1155,6 +1163,19 @@ function deleteAllFromHost(){
   );
 }
 
+// Rebuild _meta.json index from sidecar files — repairs entries lost to a crash.
+async function rebuildIndex(){
+  showConfirm(
+    'Rebuild the cache index from disk?\n\nThis scans all sidecar files and may take a few seconds for large caches. Safe to run while the proxy is active.',
+    async()=>{
+      const r = await fetch('/api/rebuild-index', {method:'POST'});
+      const d = await r.json();
+      toast(`Index rebuilt: ${(d.rebuilt||0).toLocaleString()} entries`);
+      load();
+    }
+  );
+}
+
 // ── Cached table ───────────────────────────────────────────────────────────
 function render(){
   const q = document.getElementById('srch').value.toLowerCase();
@@ -1643,7 +1664,7 @@ def api_delete():
         except Exception: pass
         meta["stats"]["total"] = len(meta["cached_urls"])
         meta["stats"]["bytes"] = sum(v.get("size",0) for v in meta["cached_urls"].values())
-        META_FILE.write_text(json.dumps(meta, indent=2), "utf-8")
+        _atomic_write_json(META_FILE, meta)
         _meta_cache_ts = 0.0
     return jsonify({"ok": True})
 
@@ -1694,12 +1715,55 @@ def api_delete_bulk():
                     pass
                 deleted += 1
 
-    # Recompute stats and persist
+    # Recompute stats and persist atomically
     meta["stats"]["total"] = len(cached)
     meta["stats"]["bytes"] = sum(v.get("size", 0) for v in cached.values())
-    META_FILE.write_text(json.dumps(meta, indent=2), "utf-8")
+    _atomic_write_json(META_FILE, meta)
     _meta_cache_ts = 0.0  # Invalidate in-memory cache so next poll sees updated state
     return jsonify({"ok": True, "deleted": deleted})
+
+@app.route("/api/rebuild-index", methods=["POST"])
+def api_rebuild_index():
+    """Rebuild _meta.json by scanning all sidecar .meta.json files on disk.
+
+    Useful after a crash that corrupted or emptied the index — the sidecar files
+    always survive since they are written atomically alongside each cached file.
+    Rebuilding is slow for large caches (a few seconds) but fully safe to run
+    while the proxy is serving traffic.
+    """
+    global _meta_cache_ts
+    cached_urls: dict = {}
+    total_bytes: int  = 0
+    errors: int       = 0
+
+    for sidecar in CACHE_DIR.rglob("*.meta.json"):
+        name = sidecar.name
+        if not name.endswith(".meta.json"):
+            continue
+        content_name = name[: -len(".meta.json")]
+        try:
+            data = json.loads(sidecar.read_text("utf-8"))
+            url  = data.get("url")
+            if not url:
+                errors += 1
+                continue
+            size = data.get("size", 0)
+            rel  = str((sidecar.parent / content_name).relative_to(CACHE_DIR))
+            cached_urls[url] = {
+                "path":         rel,
+                "content_type": data.get("content_type", "application/octet-stream"),
+                "size":         size,
+                "cached_at":    data.get("cached_at", ""),
+            }
+            total_bytes += size
+        except Exception:
+            errors += 1
+
+    meta = {"cached_urls": cached_urls,
+            "stats": {"total": len(cached_urls), "bytes": total_bytes}}
+    _atomic_write_json(META_FILE, meta)
+    _meta_cache_ts = 0.0  # Invalidate dashboard cache so next poll returns fresh data
+    return jsonify({"ok": True, "rebuilt": len(cached_urls), "errors": errors})
 
 @app.route("/api/queue-clear", methods=["POST"])
 def api_queue_clear():
