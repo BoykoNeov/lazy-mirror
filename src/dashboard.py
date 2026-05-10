@@ -606,6 +606,7 @@ tr:hover td{background:#13161e}
 let entries=[], failedEntries=[], queueEntries=[], activeHost='', currentTab='cached';
 let maxQSeen=0, currentDepth=0;
 let _lastQueueData=[], _delaySaveTimer=null;
+let _lastNonEmptyQueueTime = 0;  // timestamp of last poll that returned queue items
 const selectedQueueUrls = new Set();
 const selectedCacheUrls = new Set(); // tracks which cached URLs have their checkbox checked
 let hostsData = {};                  // per-hostname {count, bytes} from last /api/cache poll
@@ -640,23 +641,21 @@ async function load(){
   cacheTotalFiltered = cache.total_filtered || 0;  // total entries matching current filter
   failedEntries      = failed.entries||[];
 
-  // Only update queue if data actually changed (prevents flicker)
+  // Queue debounce: the proxy worker writes _queue.json between every fetch, so the
+  // file can be transiently empty mid-write even while items are still being processed.
+  // Strategy: always accept non-empty data immediately; only clear the display after
+  // the server has returned empty for at least 5 continuous seconds.
   const newQ = qData.items||[];
-  const newQJson = JSON.stringify(newQ.map(i=>i.url));
-  const oldQJson = JSON.stringify(_lastQueueData.map(i=>i.url));
-  if(newQJson !== oldQJson || newQ.length !== _lastQueueData.length){
-    // Accept if new data is non-empty OR if old data was already empty
-    if(newQ.length > 0 || _lastQueueData.length === 0){
-      queueEntries = newQ;
-      _lastQueueData = newQ;
-    } else if(newQ.length === 0){
-      // Only clear if we get 3 consecutive empty responses (debounce flicker)
-      _emptyCount = (_emptyCount||0) + 1;
-      if(_emptyCount >= 2){ queueEntries=[]; _lastQueueData=[]; _emptyCount=0; }
-    }
-  } else {
-    _emptyCount = 0;
+  if(newQ.length > 0){
+    _lastNonEmptyQueueTime = Date.now();
+    queueEntries   = newQ;
+    _lastQueueData = newQ;
+  } else if(Date.now() - _lastNonEmptyQueueTime > 5000){
+    // Genuinely empty for 5+ seconds — clear the display.
+    queueEntries   = [];
+    _lastQueueData = [];
   }
+  // else: transient empty within 5s of last real data — keep showing previous snapshot.
 
   // Stats
   document.getElementById('sTotal').textContent = cache.stats.total.toLocaleString();
@@ -693,8 +692,6 @@ async function load(){
   // (like clearFailed) changes the data, the action buttons must be refreshed here.
   syncTabActions();
 }
-let _emptyCount=0;
-
 // Refresh the tabActions toolbar to match the current tab and live entry counts.
 function syncTabActions(){
   const ta = document.getElementById('tabActions');
