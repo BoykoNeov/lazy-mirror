@@ -724,6 +724,50 @@ def _write_queue_file(force: bool = False):
         pass
 
 
+def _restore_queue_from_file():
+    """Re-queue any URLs that were pending when the last session ended.
+
+    The worker writes _queue.json after every fetch but never reads it back on
+    startup, so items left in the file after a crash or manual close would
+    appear in the dashboard forever without ever being downloaded.  This
+    function runs once at module load time to push those items back into the
+    in-memory queue and start the worker thread so they are actually processed.
+    """
+    if not QUEUE_FILE.exists():
+        return
+    try:
+        data = json.loads(QUEUE_FILE.read_text("utf-8"))
+    except Exception as e:
+        log.warning(f"[LazyMirror] Could not read queue file on startup: {e}")
+        return
+
+    count = 0
+    with _inflight_lock:
+        for item in data:
+            url = item.get("url")
+            if not url:
+                continue
+            # Skip if already cached — no point re-downloading.
+            if is_cached(url):
+                continue
+            referer     = item.get("referer") or ""
+            force       = bool(item.get("force", False))
+            depth       = int(item.get("depth", 0))
+            origin_host = item.get("origin_host") or ""
+            # Register in _inflight so concurrent proxy requests don't double-schedule.
+            _inflight.add(url)
+            _fetch_queue.put((url, referer, force, depth, origin_host))
+            count += 1
+
+    if count:
+        log.info(f"[LazyMirror] Restored {count} queued URL(s) from previous session")
+        # Start the worker so restored items are actually downloaded.
+        _ensure_worker()
+
+# Re-populate the in-memory queue from any items the previous session left behind.
+_restore_queue_from_file()
+
+
 def set_paused(paused: bool):
     if paused: _pause_event.clear()
     else:      _pause_event.set()
