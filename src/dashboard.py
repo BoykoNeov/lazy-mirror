@@ -629,8 +629,23 @@ async function load(){
   updateQueueBar(state);
   renderBlockList(state.blocked_domains||[]);
   renderActive();
+  // Keep tabActions in sync with live data on every poll cycle.
+  // switchTab() only runs when the user clicks a tab, so after a background action
+  // (like clearFailed) changes the data, the action buttons must be refreshed here.
+  syncTabActions();
 }
 let _emptyCount=0;
+
+// Refresh the tabActions toolbar to match the current tab and live entry counts.
+function syncTabActions(){
+  const ta = document.getElementById('tabActions');
+  if(currentTab === 'failed'){
+    ta.innerHTML = failedEntries.length
+      ? `<button class="btn warn" onclick="retryAll()">↻ Retry all</button>
+         <button class="btn danger" onclick="clearFailed()">Clear</button>`
+      : '';
+  }
+}
 
 // ── Summary bar ────────────────────────────────────────────────────────────
 function updateSummary(){
@@ -846,10 +861,7 @@ function switchTab(name,el){
   el.classList.add('active');
   ['cached','queue','failed'].forEach(n=>
     document.getElementById('tab'+n.charAt(0).toUpperCase()+n.slice(1)).style.display=n===name?'':'none');
-  const ta=document.getElementById('tabActions');
-  ta.innerHTML = name==='failed'&&failedEntries.length
-    ? `<button class="btn warn" onclick="retryAll()">↻ Retry all</button>
-       <button class="btn danger" onclick="clearFailed()">Clear</button>` : '';
+  syncTabActions(); // update action buttons for newly active tab
   renderActive();
 }
 
@@ -1177,7 +1189,13 @@ function clearFailed(){
     'Clear all',
     async()=>{
       await fetch('/api/clear-failed',{method:'POST'});
-      toast('Failed list cleared'); load();
+      // Optimistic update: clear local state immediately so the table empties
+      // right now without waiting for the load() network round-trip to finish.
+      failedEntries = [];
+      syncTabActions();
+      renderActive();
+      toast('Failed list cleared');
+      load(); // background refresh to confirm server state
     }
   );
 }
@@ -1190,6 +1208,10 @@ function dismissFailed(enc){
     async()=>{
       await fetch('/api/clear-failed',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({url})});
+      // Optimistic update: remove just this entry from local state immediately
+      failedEntries = failedEntries.filter(e => e.url !== url);
+      syncTabActions();
+      renderActive();
       load();
     }
   );
