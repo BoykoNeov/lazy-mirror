@@ -20,7 +20,8 @@ CACHE_DIR   = Path(os.environ.get("LAZYMIRROR_CACHE",
 META_FILE   = CACHE_DIR / "_meta.json"
 STATE_FILE  = CACHE_DIR / "_state.json"
 FAILED_FILE = CACHE_DIR / "_failed.json"
-QUEUE_FILE  = CACHE_DIR / "_queue.json"
+QUEUE_FILE       = CACHE_DIR / "_queue.json"
+QUEUE_DEPTH_FILE = CACHE_DIR / "_queue_depth.json"  # written by proxy only — avoids _state.json write race
 
 app = Flask(__name__)
 
@@ -77,6 +78,19 @@ def load_queue():
         try: return json.loads(QUEUE_FILE.read_text("utf-8"))
         except Exception: pass
     return []
+
+def load_queue_depth() -> int:
+    """Read the live queue count from the proxy's dedicated depth file.
+
+    The proxy writes _queue_depth.json after every fetch instead of patching
+    _state.json, so the dashboard and proxy are never writing the same file
+    concurrently.  Falls back to counting _queue.json items if the file is
+    missing (first run) or transiently unreadable.
+    """
+    try:
+        return json.loads(QUEUE_DEPTH_FILE.read_text("utf-8")).get("queue_depth", 0)
+    except Exception:
+        return len(load_queue())
 
 def url_to_path(url):
     from urllib.parse import unquote
@@ -1558,7 +1572,13 @@ def api_cache():
     return jsonify({"entries": entries, "total_filtered": total_filtered, "stats": stats, "hosts": hosts})
 
 @app.route("/api/mode")
-def api_mode(): return jsonify(load_state())
+def api_mode():
+    s = load_state()
+    # Overlay the live queue depth from the proxy's dedicated file.
+    # The proxy writes _queue_depth.json; it never writes _state.json.
+    # This prevents the write race that caused pause/delay/toggles to revert.
+    s["queue_depth"] = load_queue_depth()
+    return jsonify(s)
 
 @app.route("/api/failed")
 def api_failed(): return jsonify({"entries": list(load_failed().values())})

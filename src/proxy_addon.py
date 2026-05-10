@@ -45,8 +45,9 @@ CACHE_DIR   = Path(os.environ.get("LAZYMIRROR_CACHE",
 META_FILE   = CACHE_DIR / "_meta.json"
 STATE_FILE  = CACHE_DIR / "_state.json"
 FAILED_FILE = CACHE_DIR / "_failed.json"
-QUEUE_FILE  = CACHE_DIR / "_queue.json"
-LOG_FILE    = CACHE_DIR / "_proxy.log"
+QUEUE_FILE       = CACHE_DIR / "_queue.json"
+QUEUE_DEPTH_FILE = CACHE_DIR / "_queue_depth.json"  # written by proxy only; dashboard reads from here
+LOG_FILE         = CACHE_DIR / "_proxy.log"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(filename=str(LOG_FILE), level=logging.INFO,
@@ -155,15 +156,36 @@ def save_state(s: dict):
         STATE_FILE.write_text(json.dumps(s, indent=2, ensure_ascii=False), "utf-8")
 
 def _patch_state(**kw):
-    """Update only specific keys in state — never overwrites unrelated keys."""
+    """Update only specific keys in state — never overwrites unrelated keys.
+
+    NOTE: Do NOT call this with queue_depth — use _write_queue_depth() instead.
+    Writing queue_depth via _patch_state would do a read-modify-write on _state.json,
+    which is also written by the dashboard process; that cross-process race caused
+    user settings (pause, delay, toggles) to be silently clobbered after every fetch.
+    """
     global _state_cache_ts
     with _state_lock:
-        # Re-read inside lock to get freshest version, then merge
+        # Force a fresh disk read — bypass the 1-second TTL cache to avoid reading
+        # a stale snapshot that would clobber concurrent dashboard writes.
+        _state_cache_ts = 0.0
         s = load_state()
         s.update(kw)
-        # Write directly (bypass save_state to avoid double-lock)
         STATE_FILE.write_text(json.dumps(s, indent=2, ensure_ascii=False), "utf-8")
         _state_cache_ts = 0.0
+
+
+def _write_queue_depth(n: int):
+    """Write live queue depth to its own file — the proxy's only output to disk.
+
+    This replaces _patch_state(queue_depth=n) for all worker/scheduler paths.
+    The proxy NEVER writes _state.json; the dashboard owns _state.json exclusively.
+    Having a single writer per file eliminates the cross-process write race that
+    caused pause/delay/toggle settings to revert after every background fetch.
+    """
+    try:
+        QUEUE_DEPTH_FILE.write_text(json.dumps({"queue_depth": n}), "utf-8")
+    except Exception:
+        pass
 
 # ── Meta ──────────────────────────────────────────────────────────────────────
 def load_meta() -> dict:
@@ -761,6 +783,9 @@ def _restore_queue_from_file():
 
     if count:
         log.info(f"[LazyMirror] Restored {count} queued URL(s) from previous session")
+        # Publish the restored count immediately so the dashboard shows it right away,
+        # before the worker has processed any items and called _write_queue_depth itself.
+        _write_queue_depth(count)
         # Start the worker so restored items are actually downloaded.
         _ensure_worker()
 
@@ -792,7 +817,7 @@ def _worker_loop():
         try:
             item = _fetch_queue.get(timeout=1)
         except _queue_mod.Empty:
-            _patch_state(queue_depth=_fetch_queue.qsize())
+            _write_queue_depth(_fetch_queue.qsize())
             _write_queue_file(force=True)
             continue
 
@@ -805,7 +830,7 @@ def _worker_loop():
         except Exception as e:
             log.debug("Worker error %s: %s", url, e)
         finally:
-            _patch_state(queue_depth=_fetch_queue.qsize())
+            _write_queue_depth(_fetch_queue.qsize())
             _write_queue_file()   # throttled — no-ops unless 2 s have elapsed since last flush
 
         delay_ms = load_state().get("fetch_delay_ms", 0) or 0
@@ -934,7 +959,7 @@ def _schedule_batch(urls: set, referer: str, depth: int,
     for url in to_add:
         _fetch_queue.put((url, referer, force, depth, origin_host))
     if to_add:
-        _patch_state(queue_depth=_fetch_queue.qsize())
+        _write_queue_depth(_fetch_queue.qsize())
         _write_queue_file()
     return len(to_add)
 
@@ -951,27 +976,27 @@ def refetch_url(url: str):
     hops = load_state().get("crawl_depth", 0)
     host = urlparse(url).hostname or ""
     _fetch_queue.put((url, url, True, hops, host))
-    _patch_state(queue_depth=_fetch_queue.qsize())
+    _write_queue_depth(_fetch_queue.qsize())
     _write_queue_file()
 
 def remove_from_queue(url: str):
     _fetch_queue.remove_url(url)
     with _inflight_lock: _inflight.discard(url)
-    _patch_state(queue_depth=_fetch_queue.qsize())
+    _write_queue_depth(_fetch_queue.qsize())
     _write_queue_file()
 
 def remove_urls_from_queue(urls: set):
     removed = _fetch_queue.remove_urls(urls)
     with _inflight_lock:
         for u in urls: _inflight.discard(u)
-    _patch_state(queue_depth=_fetch_queue.qsize())
+    _write_queue_depth(_fetch_queue.qsize())
     _write_queue_file()
     return removed
 
 def clear_queue():
     n = _fetch_queue.clear()
     with _inflight_lock: _inflight.clear()
-    _patch_state(queue_depth=0)
+    _write_queue_depth(0)
     _write_queue_file()
     return n
 
@@ -1089,7 +1114,7 @@ class LazyMirrorAddon:
                     for u in harvest_css(body, url):
                         _schedule_one(u, referer=url, depth=0,
                                       origin_host=origin_host)
-                    _patch_state(queue_depth=_fetch_queue.qsize())
+                    _write_queue_depth(_fetch_queue.qsize())
                     _write_queue_file()
         except Exception as e:
             log.warning("Harvest error %s: %s", url, e)
