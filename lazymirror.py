@@ -46,6 +46,79 @@ def find_mitmdump() -> str:
     return None
 
 
+# ── Stale-instance cleanup ────────────────────────────────────────────────────
+# If a previous LazyMirror run was left behind (e.g. console closed without
+# Ctrl+C), its dashboard/proxy processes still hold our ports.  The functions
+# below detect those orphans via netstat and kill them before we start.
+
+def _port_pids(port: int) -> list:
+    """Return list of PIDs currently LISTENING on the given port (netstat)."""
+    try:
+        out = subprocess.check_output(
+            ["netstat", "-ano"], text=True, stderr=subprocess.DEVNULL, timeout=5
+        )
+        pids = []
+        for line in out.splitlines():
+            parts = line.split()
+            # netstat line: Proto  LocalAddr  ForeignAddr  State  PID
+            if len(parts) >= 5 and parts[3] == "LISTENING":
+                if parts[1].endswith(f":{port}"):
+                    try:
+                        pids.append(int(parts[4]))
+                    except ValueError:
+                        pass
+        return list(set(pids))
+    except Exception:
+        return []
+
+
+def _cmdline_of(pid: int) -> str:
+    """Return the command-line string for a PID (empty string on error)."""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"],
+            capture_output=True, text=True, timeout=5
+        )
+        return result.stdout.strip().lower()
+    except Exception:
+        return ""
+
+
+def release_ports():
+    """Kill any orphaned LazyMirror processes that are holding our ports.
+
+    Safety: only terminates processes whose command line contains a known
+    LazyMirror script name.  Unrelated programs on the same port numbers
+    (e.g. a local web server on 8080) are left untouched.
+    """
+    # The three ports LazyMirror owns: proxy, dashboard, cache-browser
+    own_pid   = os.getpid()
+    lm_ports  = [8080, 7779, 7780]
+    lm_keywords = ("dashboard.py", "lazymirror.py", "proxy_addon.py", "mitmdump")
+    killed    = set()
+
+    for port in lm_ports:
+        for pid in _port_pids(port):
+            if pid == own_pid or pid in killed:
+                continue
+            cmdline = _cmdline_of(pid)
+            if any(kw in cmdline for kw in lm_keywords):
+                try:
+                    subprocess.call(
+                        ["taskkill", "/F", "/PID", str(pid)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+                    print(f"  Stopped stale LazyMirror process (PID {pid}) on port {port}")
+                    killed.add(pid)
+                except Exception:
+                    pass
+
+    if killed:
+        # Brief pause so the OS fully releases the port sockets
+        time.sleep(0.8)
+
+
 # ── Processes ─────────────────────────────────────────────────────────────────
 proxy_proc     = None
 dashboard_proc = None
@@ -131,6 +204,9 @@ def run_tray():
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
+    # Clean up any orphaned processes from a previous run before grabbing ports
+    release_ports()
+
     print()
     print("=" * 58)
     print("  LazyMirror — On-demand offline web archiver")
