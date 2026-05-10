@@ -764,10 +764,6 @@ def _restore_queue_from_file():
         # Start the worker so restored items are actually downloaded.
         _ensure_worker()
 
-# Re-populate the in-memory queue from any items the previous session left behind.
-_restore_queue_from_file()
-
-
 def set_paused(paused: bool):
     if paused: _pause_event.clear()
     else:      _pause_event.set()
@@ -780,6 +776,7 @@ def _ensure_worker():
         if not _worker_started:
             threading.Thread(target=_worker_loop, daemon=True).start()
             _worker_started = True
+
 
 
 def _worker_loop():
@@ -1097,5 +1094,9 @@ class LazyMirrorAddon:
         except Exception as e:
             log.warning("Harvest error %s: %s", url, e)
 
+
+# Re-populate the in-memory queue from any items the previous session left behind.
+# Placed here so all functions (_ensure_worker, _worker_loop, etc.) are defined first.
+_restore_queue_from_file()
 
 addons = [LazyMirrorAddon()]
