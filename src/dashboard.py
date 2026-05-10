@@ -1494,18 +1494,47 @@ async function removeBlock(domain){
 // ── Export ─────────────────────────────────────────────────────────────────
 function openExport(){document.getElementById('exportModal').classList.add('show');document.getElementById('exportProgress').textContent='';}
 function closeExport(){document.getElementById('exportModal').classList.remove('show');}
+let _exportPollTimer=null;
+function _pollExport(){
+  _exportPollTimer=setTimeout(async()=>{
+    try{
+      const s=await fetch('/api/export_status').then(r=>r.json());
+      const prog=document.getElementById('exportProgress');
+      if(s.running){
+        const remaining=s.total-s.done;
+        prog.textContent=`Exporting… ${s.done} / ${s.total} (${remaining} remaining)`;
+        _pollExport();
+      }else if(s.error){
+        prog.textContent='Error: '+s.error;
+        document.getElementById('exportBtn').disabled=false;
+      }else if(s.dest){
+        prog.textContent=`✓ Exported ${s.count} files to ${s.dest}`;
+        document.getElementById('exportBtn').disabled=false;
+      }
+    }catch(e){
+      document.getElementById('exportProgress').textContent='Error: '+e;
+      document.getElementById('exportBtn').disabled=false;
+    }
+  },300);
+}
 async function doExport(){
   const dest=document.getElementById('exportPath').value.trim();
   if(!dest){toast('Enter a path first');return;}
   document.getElementById('exportBtn').disabled=true;
-  document.getElementById('exportProgress').textContent='Exporting…';
+  document.getElementById('exportProgress').textContent='Starting…';
   try{
     const r=await fetch('/api/export',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({dest})}).then(r=>r.json());
-    document.getElementById('exportProgress').textContent=
-      r.ok?`✓ Exported ${r.count} files to ${r.dest}`:'Error: '+(r.error||'unknown');
-  }catch(e){document.getElementById('exportProgress').textContent='Error: '+e;}
-  document.getElementById('exportBtn').disabled=false;
+    if(!r.ok){
+      document.getElementById('exportProgress').textContent='Error: '+(r.error||'unknown');
+      document.getElementById('exportBtn').disabled=false;
+      return;
+    }
+    _pollExport();
+  }catch(e){
+    document.getElementById('exportProgress').textContent='Error: '+e;
+    document.getElementById('exportBtn').disabled=false;
+  }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -2052,62 +2081,89 @@ def _rewrite_css(raw: bytes, page_url: str, url_map: dict,
 
 
 
+# Tracks progress of the currently-running (or last-completed) export.
+_export_progress: dict = {"running": False, "done": 0, "total": 0,
+                          "count": 0, "dest": None, "error": None}
+
+
+@app.route("/api/export_status")
+def api_export_status():
+    return jsonify(dict(_export_progress))
+
+
 @app.route("/api/export", methods=["POST"])
 def api_export():
+    global _export_progress
     data = request.get_json() or {}
     dest = data.get("dest", "").strip()
     if not dest:
         return jsonify({"ok": False, "error": "No destination path"})
+    if _export_progress.get("running"):
+        return jsonify({"ok": False, "error": "Export already in progress"})
     dest_path = Path(dest)
     try:
         dest_path.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 
-    meta    = load_meta()
-    entries = meta.get("cached_urls", {})
-    url_map = _build_url_map(entries)
-    # Compile all cached URLs into a single alternation regex (longest first to avoid
-    # partial matches) — makes absolute-URL replacement O(n) per file instead of O(n×m),
-    # which is critical when exporting caches with thousands of unique URLs.
-    url_pattern = re.compile(
-        '|'.join(re.escape(u) for u in sorted(url_map, key=len, reverse=True))
-    ) if url_map else None
-    count   = 0
-
-    for url, info in entries.items():
-        src = CACHE_DIR / info.get("path", "")
-        if not src.exists():
-            continue
-        out = dest_path / Path(info.get("path", ""))
-        out.parent.mkdir(parents=True, exist_ok=True)
-        sc  = src.with_suffix(src.suffix + ".meta.json")
-        ct  = info.get("content_type", "")
+    def _run():
+        global _export_progress
         try:
-            raw = src.read_bytes()
-            if "html" in ct or "xhtml" in ct:
-                raw = _rewrite_html(raw, url, url_map, dest_path, out, sc, url_pattern)
-            elif "css" in ct:
-                raw = _rewrite_css(raw, url, url_map, dest_path, out, sc, url_pattern)
-            out.write_bytes(raw)
-        except Exception:
-            shutil.copy2(src, out)
-        count += 1
+            meta    = load_meta()
+            entries = meta.get("cached_urls", {})
+            url_map = _build_url_map(entries)
+            # Compile all cached URLs into a single alternation regex (longest first to avoid
+            # partial matches) — makes absolute-URL replacement O(n) per file instead of O(n×m),
+            # which is critical when exporting caches with thousands of unique URLs.
+            url_pattern = re.compile(
+                '|'.join(re.escape(u) for u in sorted(url_map, key=len, reverse=True))
+            ) if url_map else None
 
-    pages = [(u, i) for u, i in entries.items() if "html" in i.get("content_type", "")]
-    idx = [
-        "<!DOCTYPE html><html><head><meta charset=UTF-8>",
-        "<style>body{font-family:sans-serif;padding:24px;max-width:900px;margin:auto}"
-        "h1{margin-bottom:16px}li{margin:4px 0}a{color:#38bdf8}</style>",
-        "<title>LazyMirror Export</title></head><body>",
-        f"<h1>LazyMirror \u2014 {count} cached files</h1>",
-        "<p>Click any page below to browse the offline archive.</p><ul>",
-    ]
-    for url, info in sorted(pages, key=lambda x: x[0]):
-        idx.append(f'<li><a href="{info.get("path","").replace(chr(92), "/")}">{url}</a></li>')
-    idx += ["</ul></body></html>"]
-    (dest_path / "index.html").write_text("\n".join(idx), "utf-8")
-    return jsonify({"ok": True, "count": count, "dest": str(dest_path)})
+            total = sum(1 for info in entries.values()
+                        if (CACHE_DIR / info.get("path", "")).exists())
+            _export_progress = {"running": True, "done": 0, "total": total,
+                                 "count": 0, "dest": None, "error": None}
+            count = 0
+
+            for url, info in entries.items():
+                src = CACHE_DIR / info.get("path", "")
+                if not src.exists():
+                    continue
+                out = dest_path / Path(info.get("path", ""))
+                out.parent.mkdir(parents=True, exist_ok=True)
+                sc  = src.with_suffix(src.suffix + ".meta.json")
+                ct  = info.get("content_type", "")
+                try:
+                    raw = src.read_bytes()
+                    if "html" in ct or "xhtml" in ct:
+                        raw = _rewrite_html(raw, url, url_map, dest_path, out, sc, url_pattern)
+                    elif "css" in ct:
+                        raw = _rewrite_css(raw, url, url_map, dest_path, out, sc, url_pattern)
+                    out.write_bytes(raw)
+                except Exception:
+                    shutil.copy2(src, out)
+                count += 1
+                _export_progress["done"] = count
+
+            pages = [(u, i) for u, i in entries.items() if "html" in i.get("content_type", "")]
+            idx = [
+                "<!DOCTYPE html><html><head><meta charset=UTF-8>",
+                "<style>body{font-family:sans-serif;padding:24px;max-width:900px;margin:auto}"
+                "h1{margin-bottom:16px}li{margin:4px 0}a{color:#38bdf8}</style>",
+                "<title>LazyMirror Export</title></head><body>",
+                f"<h1>LazyMirror \u2014 {count} cached files</h1>",
+                "<p>Click any page below to browse the offline archive.</p><ul>",
+            ]
+            for url, info in sorted(pages, key=lambda x: x[0]):
+                idx.append(f'<li><a href="{info.get("path","").replace(chr(92), "/")}">{url}</a></li>')
+            idx += ["</ul></body></html>"]
+            (dest_path / "index.html").write_text("\n".join(idx), "utf-8")
+            _export_progress.update({"running": False, "count": count, "dest": str(dest_path)})
+        except Exception as e:
+            _export_progress.update({"running": False, "error": str(e)})
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"ok": True, "started": True})
 
 
 # ── Cache browser ─────────────────────────────────────────────────────────────
