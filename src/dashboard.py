@@ -297,6 +297,30 @@ tr:hover td{background:#13161e}
                font-size:11px;color:var(--mut)}
 .cache-sel-bar.show{display:flex}
 
+/* ── PAGINATION & SORT ── */
+.pg-bar{display:flex;align-items:center;gap:5px;padding:5px 0;font-size:11px;flex-wrap:wrap}
+/* Prev/Next/First/Last navigation buttons */
+.pg-nav-btn{background:none;border:1px solid var(--bdr);color:var(--txt);border-radius:4px;
+            padding:1px 8px;cursor:pointer;font-size:11px;line-height:1.6}
+.pg-nav-btn:hover:not([disabled]){border-color:var(--acc);color:var(--acc)}
+.pg-nav-btn[disabled]{opacity:.3;cursor:default}
+/* Page-size selector buttons (100/500) and sort-scope buttons (All / This page) */
+.pg-sz-btn,.scope-btn{background:none;border:1px solid var(--bdr);color:var(--mut);
+           border-radius:4px;padding:1px 7px;cursor:pointer;font-size:10px;line-height:1.6}
+.pg-sz-btn.active{border-color:var(--acc);color:var(--acc)}
+.scope-btn.active{border-color:var(--acc2);color:var(--acc2)}
+.pg-info{color:var(--mut);font-size:10px;white-space:nowrap}
+/* Jump-to-page number input */
+.pg-jump{width:40px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+         border-radius:4px;padding:1px 4px;font-size:11px;text-align:center;outline:none}
+.pg-sep{color:var(--bdr);padding:0 3px;user-select:none}
+.pg-lbl{color:var(--mut);font-size:10px}
+/* Clickable sort column headers */
+.sort-th{cursor:pointer;user-select:none;white-space:nowrap}
+.sort-th:hover{color:var(--acc)}
+/* Sort direction icon — JS sets ⇅ / ▲ / ▼ */
+.sort-icon{color:var(--bdr);font-size:9px;margin-left:2px}
+
 .empty{text-align:center;padding:50px 20px;color:var(--mut)}
 .empty-i{font-size:36px;margin-bottom:8px}
 .empty-t{font-size:15px;color:var(--txt);margin-bottom:5px}
@@ -482,14 +506,22 @@ tr:hover td{background:#13161e}
         <button class="btn danger" id="delHostBtn" onclick="deleteAllFromHost()" style="display:none"></button>
         <button class="btn" id="deselectAllBtn" onclick="clearCacheSelection()" style="display:none">Deselect all</button>
       </div>
+      <!-- Top bar: page-size selector, sort-scope toggle, entry count -->
+      <div class="pg-bar" id="cachePgTop"></div>
       <table>
         <thead><tr>
           <!-- Master checkbox: checked=all visible selected; indeterminate=partial -->
           <th class="chk-col"><input type="checkbox" class="row-cb" id="cacheSelectAll" onchange="toggleCacheSelectAll()"/></th>
-          <th>Type</th><th>URL</th><th>Size</th><th>Cached</th><th></th>
+          <th class="sort-th" onclick="setSort('cache','type')"><span class="sort-icon" id="si-cache-type">⇅</span> Type</th>
+          <th class="sort-th" onclick="setSort('cache','url')"><span class="sort-icon" id="si-cache-url">⇅</span> URL</th>
+          <th class="sort-th" onclick="setSort('cache','size')"><span class="sort-icon" id="si-cache-size">⇅</span> Size</th>
+          <th class="sort-th" onclick="setSort('cache','cached_at')"><span class="sort-icon" id="si-cache-cached_at">▼</span> Cached</th>
+          <th></th>
         </tr></thead>
         <tbody id="tbody"></tbody>
       </table>
+      <!-- Bottom bar: prev/next/jump page navigation -->
+      <div class="pg-bar" id="cachePgNav"></div>
       <div class="empty" id="emptyCached" style="display:none">
         <div class="empty-i">📭</div><div class="empty-t">Nothing cached yet</div>
         <div>Browse any site through the proxy.</div>
@@ -507,11 +539,14 @@ tr:hover td{background:#13161e}
         <thead>
           <tr>
             <th class="chk-col"><input type="checkbox" class="row-cb" id="selectAll" onchange="toggleSelectAll()"/></th>
-            <th>Depth</th><th>URL</th><th>Referer / Origin</th><th></th>
+            <th>Depth</th>
+            <th class="sort-th" onclick="setSort('queue','url')"><span class="sort-icon" id="si-queue-url">⇅</span> URL</th>
+            <th>Referer / Origin</th><th></th>
           </tr>
         </thead>
         <tbody id="queueTbody"></tbody>
       </table>
+      <div class="pg-bar" id="queuePgNav"></div>
       <div class="empty" id="emptyQueue" style="display:none">
         <div class="empty-i">✅</div><div class="empty-t">Queue is empty</div>
       </div>
@@ -520,9 +555,15 @@ tr:hover td{background:#13161e}
     <!-- Failed -->
     <div id="tabFailed" style="display:none">
       <table>
-        <thead><tr><th>URL</th><th>Reason</th><th>Failed at</th><th></th></tr></thead>
+        <thead><tr>
+          <th class="sort-th" onclick="setSort('failed','url')"><span class="sort-icon" id="si-failed-url">⇅</span> URL</th>
+          <th>Reason</th>
+          <th class="sort-th" onclick="setSort('failed','failed_at')"><span class="sort-icon" id="si-failed-failed_at">⇅</span> Failed at</th>
+          <th></th>
+        </tr></thead>
         <tbody id="failedTbody"></tbody>
       </table>
+      <div class="pg-bar" id="failedPgNav"></div>
       <div class="empty" id="emptyFailed" style="display:none">
         <div class="empty-i">✅</div><div class="empty-t">No failed fetches</div>
       </div>
@@ -570,17 +611,34 @@ const selectedCacheUrls = new Set(); // tracks which cached URLs have their chec
 let hostsData = {};                  // per-hostname {count, bytes} from last /api/cache poll
 let _confirmCallback = null;         // callback stored by showConfirm(), invoked by confirmOk()
 
+// ── Pagination / sort state ────────────────────────────────────────────────
+// Each tab has its own sort and pagination state, independent of the others.
+// sortScope 'all'  → server re-fetch with new sort, resets to page 1.
+// sortScope 'page' → client-side sort of the already-loaded page, no network request.
+const cacheState  = {page:1, pageSize:500, sortBy:'cached_at', sortDir:'desc', sortScope:'all'};
+const queueState  = {page:1, pageSize:500, sortBy:'', sortDir:'asc'};
+const failedState = {page:1, pageSize:500, sortBy:'url', sortDir:'asc'};
+let cacheTotalFiltered = 0;  // total server-side entries matching the active host/search filter
+
 // ── Polling ────────────────────────────────────────────────────────────────
 async function load(){
+  // Build cache URL with current sort, pagination, and host-filter parameters.
+  // The server sorts and paginates the full dataset so each page is consistent.
+  const _cOff = (cacheState.page - 1) * cacheState.pageSize;
+  const _cUrl = `/api/cache?sort_by=${cacheState.sortBy}&sort_dir=${cacheState.sortDir}`
+              + `&limit=${cacheState.pageSize}&offset=${_cOff}`
+              + `&host=${encodeURIComponent(activeHost)}`;
+
   const [cache, state, failed, qData] = await Promise.all([
-    fetch('/api/cache').then(r=>r.json()),
+    fetch(_cUrl).then(r=>r.json()),
     fetch('/api/mode').then(r=>r.json()),
     fetch('/api/failed').then(r=>r.json()),
     fetch('/api/queue').then(r=>r.json()),
   ]);
 
-  entries       = cache.entries||[];
-  failedEntries = failed.entries||[];
+  entries            = cache.entries||[];
+  cacheTotalFiltered = cache.total_filtered || 0;  // total entries matching current filter
+  failedEntries      = failed.entries||[];
 
   // Only update queue if data actually changed (prevents flicker)
   const newQ = qData.items||[];
@@ -606,7 +664,8 @@ async function load(){
   // Keep hostsData in module scope so deleteAllFromHost() can read total counts
   hostsData = cache.hosts || {};
   document.getElementById('sHosts').textContent = Object.keys(hostsData).length;
-  document.getElementById('sPages').textContent = entries.filter(e=>e.content_type&&e.content_type.includes('html')).length;
+  // Use server-computed page count (covers all cached content, not just the current page).
+  document.getElementById('sPages').textContent = (cache.stats.pages||0).toLocaleString();
   document.getElementById('sQueue').textContent = queueEntries.length||'—';
   document.getElementById('sFailed').textContent= failedEntries.length||'—';
   document.getElementById('qTabBadge').textContent  = queueEntries.length?`(${queueEntries.length})`:'';
@@ -881,7 +940,120 @@ function switchAside(name,el){
 function filterHost(h,el){
   activeHost=h;
   document.querySelectorAll('.host-li li').forEach(i=>i.classList.remove('active'));
-  el.classList.add('active'); render();
+  el.classList.add('active');
+  // Reset to page 1 when switching host filter — new server request needed.
+  cacheState.page = 1;
+  load();
+}
+
+// ── Pagination & sort helpers ──────────────────────────────────────────────
+
+// Extract a sortable scalar from an entry for a given column key.
+function sortVal(e, key){
+  if(key==='url')       return (e.url||'').toLowerCase();
+  if(key==='size')      return e.size||0;
+  if(key==='type')      return (e.content_type||'').toLowerCase();
+  if(key==='cached_at') return e.cached_at||'';
+  if(key==='failed_at') return e.failed_at||'';
+  return '';
+}
+
+// Return a new sorted copy of arr by key/dir without mutating the original.
+function sortArr(arr, key, dir){
+  if(!key) return arr;
+  const d = dir==='asc' ? 1 : -1;
+  return [...arr].sort((a,b)=>{
+    const va=sortVal(a,key), vb=sortVal(b,key);
+    return va<vb ? -d : va>vb ? d : 0;
+  });
+}
+
+// Update the ⇅/▲/▼ icons in a tab's column headers to reflect the active sort.
+function updateSortIcons(tab, activeSortBy, dir){
+  const cols = {cache:['type','url','size','cached_at'], queue:['url'], failed:['url','failed_at']}[tab]||[];
+  cols.forEach(col=>{
+    const el = document.getElementById(`si-${tab}-${col}`);
+    if(!el) return;
+    el.textContent = col===activeSortBy ? (dir==='asc'?'▲':'▼') : '⇅';
+  });
+}
+
+// Handle a sort-column header click: toggle direction if same column, else switch to new column.
+function setSort(tab, col){
+  const state = tab==='cache' ? cacheState : tab==='queue' ? queueState : failedState;
+  if(state.sortBy===col){
+    state.sortDir = state.sortDir==='asc' ? 'desc' : 'asc';
+  } else {
+    state.sortBy  = col;
+    state.sortDir = 'desc'; // always start descending on a newly selected column
+  }
+  state.page = 1; // changing sort resets to the first page
+
+  // Cache tab with scope='all': re-fetch from server so sort applies to all pages.
+  // Scope='page' or queue/failed: client-side only, no network request.
+  if(tab==='cache' && cacheState.sortScope==='all') load();
+  else renderActive();
+}
+
+// Change per-page size for a tab and reset to page 1.
+function setPageSize(tab, size){
+  const state = tab==='cache' ? cacheState : tab==='queue' ? queueState : failedState;
+  state.pageSize = size;
+  state.page     = 1;
+  if(tab==='cache') load(); else renderActive();
+}
+
+// Toggle cache sort scope: 'all' triggers a server re-fetch; 'page' sorts the current page locally.
+function setSortScope(scope){
+  cacheState.sortScope = scope;
+  if(scope==='all'){ cacheState.page=1; load(); }
+  else render();
+}
+
+// Navigate to a specific page number; re-fetches for cache (server-side), re-renders for others.
+function goPage(tab, page){
+  const state = tab==='cache' ? cacheState : tab==='queue' ? queueState : failedState;
+  state.page = page;
+  if(tab==='cache' && cacheState.sortScope==='all') load();
+  else renderActive();
+}
+
+// Render a pagination bar (entry count, page-size buttons, scope toggle, prev/next/jump nav).
+// containerId: id of the .pg-bar element; state: the tab's state object; total: total entries; tab: 'cache'|'queue'|'failed'.
+function renderPgBar(containerId, state, total, tab){
+  const el = document.getElementById(containerId);
+  if(!el) return;
+  const totalPages = Math.max(1, Math.ceil(total / state.pageSize));
+  const p    = state.page;
+  const from = total===0 ? 0 : (p-1)*state.pageSize+1;
+  const to   = Math.min(p*state.pageSize, total);
+
+  // Page-size selector
+  const szBtns = [100,500].map(sz=>
+    `<button class="pg-sz-btn${state.pageSize===sz?' active':''}" onclick="setPageSize('${tab}',${sz})">${sz}/page</button>`
+  ).join('');
+
+  // Sort-scope toggle — only shown on the cache tab
+  const scopePart = tab==='cache' ? `
+    <span class="pg-sep">|</span>
+    <span class="pg-lbl">Sort:</span>
+    <button class="scope-btn${cacheState.sortScope==='all'?' active':''}" onclick="setSortScope('all')" title="Sort all entries (server-side re-fetch)">All entries</button>
+    <button class="scope-btn${cacheState.sortScope==='page'?' active':''}" onclick="setSortScope('page')" title="Sort only this page locally">This page</button>
+  ` : '';
+
+  el.innerHTML = `
+    <span class="pg-info">${from.toLocaleString()}–${to.toLocaleString()} of ${total.toLocaleString()}</span>
+    <span class="pg-sep">|</span>${szBtns}${scopePart}
+    <span style="flex:1"></span>
+    <button class="pg-nav-btn" onclick="goPage('${tab}',1)" ${p<=1?'disabled':''}>«</button>
+    <button class="pg-nav-btn" onclick="goPage('${tab}',${p-1})" ${p<=1?'disabled':''}>‹</button>
+    <span class="pg-info">Page</span>
+    <input class="pg-jump" type="number" value="${p}" min="1" max="${totalPages}"
+      onchange="goPage('${tab}',Math.max(1,Math.min(${totalPages},+this.value||1)))"
+      onkeydown="if(event.key==='Enter')goPage('${tab}',Math.max(1,Math.min(${totalPages},+this.value||1)))"/>
+    <span class="pg-info">of ${totalPages}</span>
+    <button class="pg-nav-btn" onclick="goPage('${tab}',${p+1})" ${p>=totalPages?'disabled':''}>›</button>
+    <button class="pg-nav-btn" onclick="goPage('${tab}',${totalPages})" ${p>=totalPages?'disabled':''}>»</button>`;
 }
 
 // ── Cache selection ────────────────────────────────────────────────────────
@@ -974,20 +1146,32 @@ function deleteAllFromHost(){
 
 // ── Cached table ───────────────────────────────────────────────────────────
 function render(){
-  const q=document.getElementById('srch').value.toLowerCase();
-  let es=entries;
-  if(activeHost) es=es.filter(e=>{try{return new URL(e.url).hostname===activeHost}catch{return false}});
-  if(q) es=es.filter(e=>e.url.toLowerCase().includes(q));
-  const tb=document.getElementById('tbody');
-  tb.innerHTML='';
-  document.getElementById('emptyCached').style.display=es.length?'none':'block';
-  const visible=[...es].reverse();
-  visible.forEach(e=>{
+  const q = document.getElementById('srch').value.toLowerCase();
+  // `entries` contains the current server page already sorted and host-filtered.
+  // Apply client-side text search on top of that.
+  let es = q ? entries.filter(e=>e.url.toLowerCase().includes(q)) : entries;
+
+  // If sort scope is 'page', re-sort client-side (no server round-trip).
+  // Scope 'all' means the server already sorted; we display as-is.
+  if(cacheState.sortScope==='page' && cacheState.sortBy){
+    es = sortArr(es, cacheState.sortBy, cacheState.sortDir);
+  }
+
+  // Top bar: entry count, page-size buttons, sort-scope toggle.
+  // For scope='all' total is the server's cacheTotalFiltered; for 'page' total is the current page size.
+  const topTotal = cacheState.sortScope==='all' ? cacheTotalFiltered : es.length;
+  renderPgBar('cachePgTop', cacheState, topTotal, 'cache');
+
+  const tb = document.getElementById('tbody');
+  tb.innerHTML = '';
+  document.getElementById('emptyCached').style.display = es.length ? 'none' : 'block';
+
+  es.forEach(e=>{
     const enc     = encodeURIComponent(e.url);
     const checked = selectedCacheUrls.has(e.url);
     const tr      = document.createElement('tr');
     if(checked) tr.classList.add('sel');
-    // Use enc (percent-encoded) in the inline handler to avoid quote injection from URLs
+    // Use enc (percent-encoded) in inline handlers to prevent quote injection from URLs.
     tr.innerHTML=`
       <td class="chk-col"><input type="checkbox" class="row-cb" ${checked?'checked':''}
         onchange="toggleCacheRowSel(decodeURIComponent('${enc}'),this)"/></td>
@@ -1000,36 +1184,49 @@ function render(){
       </div></td>`;
     tb.appendChild(tr);
   });
-  // Sync master checkbox: fully checked when all visible are selected, indeterminate when partial
-  const selAll=document.getElementById('cacheSelectAll');
-  if(selAll && visible.length > 0){
-    const allSel = visible.every(e=>selectedCacheUrls.has(e.url));
-    const anySel = visible.some(e=>selectedCacheUrls.has(e.url));
+
+  // Sync master checkbox: fully checked when all visible rows are selected, indeterminate when partial.
+  const selAll = document.getElementById('cacheSelectAll');
+  if(selAll && es.length>0){
+    const allSel = es.every(e=>selectedCacheUrls.has(e.url));
+    const anySel = es.some(e=>selectedCacheUrls.has(e.url));
     selAll.checked       = allSel;
     selAll.indeterminate = !allSel && anySel;
   } else if(selAll){
     selAll.checked = selAll.indeterminate = false;
   }
+
+  // Bottom nav bar (prev/next/jump) — uses cacheTotalFiltered for page count.
+  renderPgBar('cachePgNav', cacheState, cacheTotalFiltered, 'cache');
   updateCacheSelBar();
+  updateSortIcons('cache', cacheState.sortBy, cacheState.sortDir);
 }
 
 // ── Queue table ────────────────────────────────────────────────────────────
 function renderQueue(){
-  const q=document.getElementById('srch').value.toLowerCase();
-  let es=queueEntries;
-  if(q) es=es.filter(e=>e.url.toLowerCase().includes(q)||(e.referer||'').toLowerCase().includes(q));
-  const tb=document.getElementById('queueTbody');
-  tb.innerHTML='';
-  document.getElementById('emptyQueue').style.display=es.length?'none':'block';
+  const q = document.getElementById('srch').value.toLowerCase();
+  let es = queueEntries;
+  if(q) es = es.filter(e=>e.url.toLowerCase().includes(q)||(e.referer||'').toLowerCase().includes(q));
 
-  es.forEach(e=>{
-    const d=e.depth??0;
-    const cls=d===0?'d0':d===1?'d1':d===2?'d2':'d3p';
-    const enc=encodeURIComponent(e.url);
+  // Client-side sort (queue data is small enough to sort entirely in JS).
+  if(queueState.sortBy) es = sortArr(es, queueState.sortBy, queueState.sortDir);
+
+  const total = es.length;
+  const start = (queueState.page - 1) * queueState.pageSize;
+  const pageEs = es.slice(start, start + queueState.pageSize);
+
+  const tb = document.getElementById('queueTbody');
+  tb.innerHTML = '';
+  document.getElementById('emptyQueue').style.display = total ? 'none' : 'block';
+
+  pageEs.forEach(e=>{
+    const d   = e.depth??0;
+    const cls = d===0?'d0':d===1?'d1':d===2?'d2':'d3p';
+    const enc = encodeURIComponent(e.url);
     const checked = selectedQueueUrls.has(e.url);
-    const tr=document.createElement('tr');
+    const tr  = document.createElement('tr');
     if(checked) tr.classList.add('sel');
-    // Use enc (percent-encoded) in all inline handlers to prevent quote injection
+    // Use enc (percent-encoded) in all inline handlers to prevent quote injection.
     tr.innerHTML=`
       <td class="chk-col"><input type="checkbox" class="row-cb" ${checked?'checked':''}
         onchange="toggleRowSel(decodeURIComponent('${enc}'),this)"/></td>
@@ -1039,7 +1236,10 @@ function renderQueue(){
       <td><button class="btn" onclick="removeOneFromQueue('${enc}')">✕</button></td>`;
     tb.appendChild(tr);
   });
+
+  renderPgBar('queuePgNav', queueState, total, 'queue');
   updateQSelBar();
+  updateSortIcons('queue', queueState.sortBy, queueState.sortDir);
 }
 
 function toggleRowSel(url, cb){
@@ -1135,22 +1335,36 @@ async function clearQueue(){
 
 // ── Failed table ───────────────────────────────────────────────────────────
 function renderFailed(){
-  const q=document.getElementById('srch').value.toLowerCase();
-  const es=failedEntries.filter(e=>!q||e.url.toLowerCase().includes(q));
-  const tb=document.getElementById('failedTbody');
-  tb.innerHTML='';
-  document.getElementById('emptyFailed').style.display=es.length?'none':'block';
-  es.forEach(e=>{
-    const enc=encodeURIComponent(e.url);
-    const tr=document.createElement('tr');
-    tr.innerHTML=`<td class="url-td" title="${e.url}">${e.url}</td>
-      <td class="fail-reason">${e.reason||'?'}</td><td class="dt">${fmtD(e.failed_at)}</td>
+  const q = document.getElementById('srch').value.toLowerCase();
+  let es = failedEntries.filter(e=>!q||e.url.toLowerCase().includes(q));
+
+  // Client-side sort.
+  if(failedState.sortBy) es = sortArr(es, failedState.sortBy, failedState.sortDir);
+
+  const total  = es.length;
+  const start  = (failedState.page - 1) * failedState.pageSize;
+  const pageEs = es.slice(start, start + failedState.pageSize);
+
+  const tb = document.getElementById('failedTbody');
+  tb.innerHTML = '';
+  document.getElementById('emptyFailed').style.display = total ? 'none' : 'block';
+
+  pageEs.forEach(e=>{
+    const enc = encodeURIComponent(e.url);
+    const tr  = document.createElement('tr');
+    tr.innerHTML=`
+      <td class="url-td" title="${e.url}">${e.url}</td>
+      <td class="fail-reason">${e.reason||'?'}</td>
+      <td class="dt">${fmtD(e.failed_at)}</td>
       <td><div class="actions">
         <button class="btn" onclick="retryOne('${enc}')">↻</button>
         <button class="btn" onclick="dismissFailed('${enc}')" style="color:var(--mut)">✕</button>
       </div></td>`;
     tb.appendChild(tr);
   });
+
+  renderPgBar('failedPgNav', failedState, total, 'failed');
+  updateSortIcons('failed', failedState.sortBy, failedState.sortDir);
 }
 
 // ── Actions ────────────────────────────────────────────────────────────────
@@ -1315,16 +1529,35 @@ def api_cache():
         except Exception: pass
     hosts = {h: {"count": hc[h], "bytes": hs[h]} for h in hc}
 
-    q    = request.args.get("q", "").strip().lower()
-    host = request.args.get("host", "").strip()
+    q        = request.args.get("q",        "").strip().lower()
+    host     = request.args.get("host",     "").strip()
+    sort_by  = request.args.get("sort_by",  "cached_at")
+    sort_dir = request.args.get("sort_dir", "desc")
+    try:    limit  = min(max(int(request.args.get("limit",  500)), 1), 1000)
+    except: limit  = 500
+    try:    offset = max(int(request.args.get("offset", 0)), 0)
+    except: offset = 0
+
     entries = [{"url": url, **info} for url, info in raw.items()]
     if q:    entries = [e for e in entries if q in e["url"].lower()]
     if host: entries = [e for e in entries if urlparse(e["url"]).hostname == host]
-    entries.sort(key=lambda e: e.get("cached_at", ""), reverse=True)
+
+    # Sort the full filtered list server-side so pagination is consistent across pages.
+    rev = (sort_dir == "desc")
+    if sort_by == "url":
+        entries.sort(key=lambda e: e["url"].lower(), reverse=rev)
+    elif sort_by == "size":
+        entries.sort(key=lambda e: e.get("size", 0), reverse=rev)
+    elif sort_by == "type":
+        entries.sort(key=lambda e: e.get("content_type", ""), reverse=rev)
+    else:  # cached_at (default)
+        entries.sort(key=lambda e: e.get("cached_at", ""), reverse=rev)
+
+    # Add total HTML-page count across all cached content for the dashboard stats widget.
+    stats["pages"] = sum(1 for info in raw.values() if "html" in info.get("content_type", ""))
+
     total_filtered = len(entries)
-    # Cap serialised payload — sending 10 k+ entries to the browser on every 3-s poll
-    # would cause noticeable jank; total_filtered lets the UI show the real count.
-    entries = entries[:500]
+    entries = entries[offset : offset + limit]
     return jsonify({"entries": entries, "total_filtered": total_filtered, "stats": stats, "hosts": hosts})
 
 @app.route("/api/mode")
