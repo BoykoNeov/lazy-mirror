@@ -208,7 +208,7 @@ def url_to_path(url: str) -> Path:
          in exported HTML without any rewriting needed
       3. Human-readable folder/file names in the cache
 
-    Windows-illegal characters (<>:"|?*\) are replaced with _.
+    Windows-illegal characters (<>:"|?*\\) are replaced with _.
     The query string (if any) is folded into the filename as a short hash.
     """
     from urllib.parse import unquote
