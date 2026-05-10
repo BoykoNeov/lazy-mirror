@@ -287,9 +287,15 @@ tr:hover td{background:#13161e}
 /* checkbox column */
 .chk-col{width:28px}
 .row-cb{width:13px;height:13px;accent-color:var(--acc);cursor:pointer}
+/* Queue selection bar — shown when one or more queue rows are checked */
 .queue-sel-bar{display:none;align-items:center;gap:8px;padding:5px 0;
                font-size:11px;color:var(--mut)}
 .queue-sel-bar.show{display:flex}
+
+/* Cache selection bar — shown when rows are selected or a host filter is active */
+.cache-sel-bar{display:none;align-items:center;gap:8px;padding:5px 0;
+               font-size:11px;color:var(--mut)}
+.cache-sel-bar.show{display:flex}
 
 .empty{text-align:center;padding:50px 20px;color:var(--mut)}
 .empty-i{font-size:36px;margin-bottom:8px}
@@ -467,8 +473,21 @@ tr:hover td{background:#13161e}
 
     <!-- Cached -->
     <div id="tabCached">
+      <!-- Selection toolbar: visible when items are selected or a domain filter is active -->
+      <div class="cache-sel-bar" id="cacheSelBar">
+        <span id="cacheSelCount"></span>
+        <!-- Delete selected URLs (uses server-side /api/delete-bulk with URL list) -->
+        <button class="btn danger" id="deleteSelBtn" onclick="deleteSelectedCache()" style="display:none">Delete selected</button>
+        <!-- Delete every cached file for the active host — bypasses the 500-item UI cap -->
+        <button class="btn danger" id="delHostBtn" onclick="deleteAllFromHost()" style="display:none"></button>
+        <button class="btn" id="deselectAllBtn" onclick="clearCacheSelection()" style="display:none">Deselect all</button>
+      </div>
       <table>
-        <thead><tr><th>Type</th><th>URL</th><th>Size</th><th>Cached</th><th></th></tr></thead>
+        <thead><tr>
+          <!-- Master checkbox: checked=all visible selected; indeterminate=partial -->
+          <th class="chk-col"><input type="checkbox" class="row-cb" id="cacheSelectAll" onchange="toggleCacheSelectAll()"/></th>
+          <th>Type</th><th>URL</th><th>Size</th><th>Cached</th><th></th>
+        </tr></thead>
         <tbody id="tbody"></tbody>
       </table>
       <div class="empty" id="emptyCached" style="display:none">
@@ -527,6 +546,18 @@ tr:hover td{background:#13161e}
     </div>
   </div>
 </div>
+<!-- CONFIRM MODAL — reused by all destructive actions -->
+<div class="modal-bg" id="confirmModal">
+  <div class="modal">
+    <h2 id="confirmTitle">Confirm</h2>
+    <p id="confirmMsg" style="white-space:pre-wrap;line-height:1.7"></p>
+    <div class="modal-btns">
+      <button class="btn" onclick="confirmCancel()">Cancel</button>
+      <!-- Label and color set dynamically by showConfirm() -->
+      <button class="btn" id="confirmOkBtn" onclick="confirmOk()">Delete</button>
+    </div>
+  </div>
+</div>
 <div id="toast"></div>
 
 <script>
@@ -535,6 +566,9 @@ let entries=[], failedEntries=[], queueEntries=[], activeHost='', currentTab='ca
 let maxQSeen=0, currentDepth=0;
 let _lastQueueData=[], _delaySaveTimer=null;
 const selectedQueueUrls = new Set();
+const selectedCacheUrls = new Set(); // tracks which cached URLs have their checkbox checked
+let hostsData = {};                  // per-hostname {count, bytes} from last /api/cache poll
+let _confirmCallback = null;         // callback stored by showConfirm(), invoked by confirmOk()
 
 // ── Polling ────────────────────────────────────────────────────────────────
 async function load(){
@@ -569,7 +603,8 @@ async function load(){
   // Stats
   document.getElementById('sTotal').textContent = cache.stats.total.toLocaleString();
   document.getElementById('sSize').textContent  = fmtB(cache.stats.bytes);
-  const hostsData = cache.hosts || {};
+  // Keep hostsData in module scope so deleteAllFromHost() can read total counts
+  hostsData = cache.hosts || {};
   document.getElementById('sHosts').textContent = Object.keys(hostsData).length;
   document.getElementById('sPages').textContent = entries.filter(e=>e.content_type&&e.content_type.includes('html')).length;
   document.getElementById('sQueue').textContent = queueEntries.length||'—';
@@ -837,6 +872,94 @@ function filterHost(h,el){
   el.classList.add('active'); render();
 }
 
+// ── Cache selection ────────────────────────────────────────────────────────
+// Toggle one row's selected state; url is the decoded URL string.
+function toggleCacheRowSel(url, cb){
+  if(cb.checked) selectedCacheUrls.add(url);
+  else           selectedCacheUrls.delete(url);
+  cb.closest('tr').classList.toggle('sel', cb.checked);
+  updateCacheSelBar();
+}
+
+// Master checkbox handler — selects/deselects all currently visible rows.
+// Rows hidden by the host-filter or search-filter are not affected.
+function toggleCacheSelectAll(){
+  const all = document.getElementById('cacheSelectAll').checked;
+  const q   = document.getElementById('srch').value.toLowerCase();
+  let es    = entries;
+  if(activeHost) es = es.filter(e=>{try{return new URL(e.url).hostname===activeHost}catch{return false}});
+  if(q) es = es.filter(e=>e.url.toLowerCase().includes(q));
+  es.forEach(e=>{ if(all) selectedCacheUrls.add(e.url); else selectedCacheUrls.delete(e.url); });
+  render(); // re-renders rows with updated checked state
+}
+
+// Clear all selected cache URLs and refresh the table.
+function clearCacheSelection(){
+  selectedCacheUrls.clear();
+  render();
+}
+
+// Sync the selection bar visibility and button labels to current selection state.
+function updateCacheSelBar(){
+  const bar       = document.getElementById('cacheSelBar');
+  const hasSelected = selectedCacheUrls.size > 0;
+  const hasHost     = !!activeHost;
+  // Show bar when items are checked OR when a domain filter is active (for host-delete button)
+  bar.classList.toggle('show', hasSelected || hasHost);
+  const countEl = document.getElementById('cacheSelCount');
+  countEl.textContent = hasSelected ? `${selectedCacheUrls.size} selected` : '';
+  document.getElementById('deleteSelBtn').style.display  = hasSelected ? '' : 'none';
+  document.getElementById('deselectAllBtn').style.display = hasSelected ? '' : 'none';
+  // Host-delete button: shows the total count from hostsData (not capped at 500)
+  const delHostBtn = document.getElementById('delHostBtn');
+  if(hasHost){
+    const total = (hostsData[activeHost]||{}).count || '?';
+    delHostBtn.textContent = `Delete all from ${activeHost} (${total} files)`;
+    delHostBtn.style.display = '';
+  } else {
+    delHostBtn.style.display = 'none';
+  }
+}
+
+// Bulk-delete selected cache URLs via /api/delete-bulk with a URL list.
+function deleteSelectedCache(){
+  if(!selectedCacheUrls.size) return;
+  const urls = [...selectedCacheUrls];
+  showConfirm(
+    'Delete from cache',
+    `Permanently delete ${urls.length} cached item${urls.length>1?'s':''}?\nThis cannot be undone.`,
+    `Delete ${urls.length} item${urls.length>1?'s':''}`,
+    async()=>{
+      await fetch('/api/delete-bulk',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({urls})});
+      urls.forEach(u=>selectedCacheUrls.delete(u));
+      toast(`Deleted ${urls.length} item${urls.length>1?'s':''} from cache`);
+      load();
+    }
+  );
+}
+
+// Delete ALL cached files for the active host — server-side so the 500-item UI cap doesn't apply.
+function deleteAllFromHost(){
+  if(!activeHost) return;
+  const total = (hostsData[activeHost]||{}).count || '?';
+  showConfirm(
+    `Delete ${activeHost}`,
+    `Permanently delete all ${total} cached files for ${activeHost}?\nThis cannot be undone.`,
+    `Delete all from ${activeHost}`,
+    async()=>{
+      await fetch('/api/delete-bulk',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({host:activeHost})});
+      selectedCacheUrls.clear();
+      toast(`Deleted all cached files for ${activeHost}`);
+      // Return to "All" domain view since the host is now empty
+      const allLi = document.querySelector('.host-li li[data-host=""]');
+      if(allLi) filterHost('', allLi);
+      else load();
+    }
+  );
+}
+
 // ── Cached table ───────────────────────────────────────────────────────────
 function render(){
   const q=document.getElementById('srch').value.toLowerCase();
@@ -846,10 +969,17 @@ function render(){
   const tb=document.getElementById('tbody');
   tb.innerHTML='';
   document.getElementById('emptyCached').style.display=es.length?'none':'block';
-  [...es].reverse().forEach(e=>{
-    const enc=encodeURIComponent(e.url);
-    const tr=document.createElement('tr');
-    tr.innerHTML=`<td>${badge(e.content_type)}</td>
+  const visible=[...es].reverse();
+  visible.forEach(e=>{
+    const enc     = encodeURIComponent(e.url);
+    const checked = selectedCacheUrls.has(e.url);
+    const tr      = document.createElement('tr');
+    if(checked) tr.classList.add('sel');
+    // Use enc (percent-encoded) in the inline handler to avoid quote injection from URLs
+    tr.innerHTML=`
+      <td class="chk-col"><input type="checkbox" class="row-cb" ${checked?'checked':''}
+        onchange="toggleCacheRowSel(decodeURIComponent('${enc}'),this)"/></td>
+      <td>${badge(e.content_type)}</td>
       <td class="url-td"><a href="/view?url=${enc}" target="_blank" title="${e.url}">${e.url}</a></td>
       <td class="sz">${fmtB(e.size)}</td><td class="dt">${fmtD(e.cached_at)}</td>
       <td><div class="actions">
@@ -858,6 +988,17 @@ function render(){
       </div></td>`;
     tb.appendChild(tr);
   });
+  // Sync master checkbox: fully checked when all visible are selected, indeterminate when partial
+  const selAll=document.getElementById('cacheSelectAll');
+  if(selAll && visible.length > 0){
+    const allSel = visible.every(e=>selectedCacheUrls.has(e.url));
+    const anySel = visible.some(e=>selectedCacheUrls.has(e.url));
+    selAll.checked       = allSel;
+    selAll.indeterminate = !allSel && anySel;
+  } else if(selAll){
+    selAll.checked = selAll.indeterminate = false;
+  }
+  updateCacheSelBar();
 }
 
 // ── Queue table ────────────────────────────────────────────────────────────
@@ -876,9 +1017,10 @@ function renderQueue(){
     const checked = selectedQueueUrls.has(e.url);
     const tr=document.createElement('tr');
     if(checked) tr.classList.add('sel');
+    // Use enc (percent-encoded) in all inline handlers to prevent quote injection
     tr.innerHTML=`
       <td class="chk-col"><input type="checkbox" class="row-cb" ${checked?'checked':''}
-        onchange="toggleRowSel('${e.url}',this)"/></td>
+        onchange="toggleRowSel(decodeURIComponent('${enc}'),this)"/></td>
       <td><span class="depth-chip ${cls}">${d}</span></td>
       <td class="url-td" title="${e.url}">${e.url}</td>
       <td class="referer-td" title="${e.referer||''}">${e.origin_host||e.referer||'—'}</td>
@@ -889,10 +1031,10 @@ function renderQueue(){
 }
 
 function toggleRowSel(url, cb){
+  // url is always the decoded string (inline handler uses decodeURIComponent)
   if(cb.checked) selectedQueueUrls.add(url);
-  else selectedQueueUrls.delete(url);
-  const tr = cb.closest('tr');
-  tr.classList.toggle('sel', cb.checked);
+  else           selectedQueueUrls.delete(url);
+  cb.closest('tr').classList.toggle('sel', cb.checked);
   updateQSelBar();
 }
 
@@ -910,26 +1052,68 @@ function clearSelection(){
   renderQueue();
 }
 
+// ── Confirm modal ──────────────────────────────────────────────────────────
+// Single shared dialog used by every destructive action so the style is consistent.
+// title    — modal heading
+// msg      — body text (supports \n line breaks via white-space:pre-wrap)
+// okLabel  — text for the confirm button (e.g. "Delete 5 items")
+// onOk     — async function to run when the user confirms
+function showConfirm(title, msg, okLabel, onOk){
+  _confirmCallback = onOk;
+  document.getElementById('confirmTitle').textContent = title;
+  document.getElementById('confirmMsg').textContent   = msg;
+  const btn = document.getElementById('confirmOkBtn');
+  btn.textContent = okLabel || 'Delete';
+  // Style the confirm button red to signal the action is destructive
+  btn.style.borderColor = 'var(--danger)';
+  btn.style.color       = 'var(--danger)';
+  document.getElementById('confirmModal').classList.add('show');
+}
+function confirmOk(){
+  document.getElementById('confirmModal').classList.remove('show');
+  if(_confirmCallback) _confirmCallback();
+  _confirmCallback = null;
+}
+function confirmCancel(){
+  document.getElementById('confirmModal').classList.remove('show');
+  _confirmCallback = null;
+}
+
 function updateQSelBar(){
   const bar=document.getElementById('qSelBar');
   bar.classList.toggle('show', selectedQueueUrls.size>0);
   document.getElementById('qSelCount').textContent=`${selectedQueueUrls.size} selected`;
 }
 
-async function deleteSelected(){
+function deleteSelected(){
   if(!selectedQueueUrls.size) return;
   const urls=[...selectedQueueUrls];
-  await fetch('/api/queue-remove',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({urls})});
-  urls.forEach(u=>selectedQueueUrls.delete(u));
-  toast(`Removed ${urls.length} item${urls.length>1?'s':''} from queue`);
-  load();
+  showConfirm(
+    'Remove from queue',
+    `Remove ${urls.length} item${urls.length>1?'s':''} from the fetch queue?`,
+    `Remove ${urls.length}`,
+    async()=>{
+      await fetch('/api/queue-remove',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({urls})});
+      urls.forEach(u=>selectedQueueUrls.delete(u));
+      toast(`Removed ${urls.length} item${urls.length>1?'s':''} from queue`);
+      load();
+    }
+  );
 }
 
-async function removeOneFromQueue(enc){
-  await fetch('/api/queue-remove',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({urls:[decodeURIComponent(enc)]})});
-  toast('Removed from queue'); load();
+function removeOneFromQueue(enc){
+  const url=decodeURIComponent(enc);
+  showConfirm(
+    'Remove from queue',
+    `Remove from fetch queue?\n${url}`,
+    'Remove',
+    async()=>{
+      await fetch('/api/queue-remove',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({urls:[url]})});
+      toast('Removed from queue'); load();
+    }
+  );
 }
 
 async function clearQueue(){
@@ -958,10 +1142,19 @@ function renderFailed(){
 }
 
 // ── Actions ────────────────────────────────────────────────────────────────
-async function del(enc){
-  await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({url:decodeURIComponent(enc)})});
-  toast('Removed from cache'); load();
+function del(enc){
+  const url=decodeURIComponent(enc);
+  showConfirm(
+    'Remove from cache',
+    `Remove this file from the offline cache?\n${url}`,
+    'Remove',
+    async()=>{
+      await fetch('/api/delete',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({url})});
+      selectedCacheUrls.delete(url); // keep selection set consistent
+      toast('Removed from cache'); load();
+    }
+  );
 }
 async function refetch(enc){
   await fetch('/api/refetch',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -977,14 +1170,29 @@ async function retryAll(){
   await fetch('/api/retry-all',{method:'POST'});
   toast('↻ Retrying all…'); load();
 }
-async function clearFailed(){
-  await fetch('/api/clear-failed',{method:'POST'});
-  toast('Cleared'); load();
+function clearFailed(){
+  showConfirm(
+    'Clear failed list',
+    'Remove all failed fetch records?\nThis only clears the log — it does not delete any cached files.',
+    'Clear all',
+    async()=>{
+      await fetch('/api/clear-failed',{method:'POST'});
+      toast('Failed list cleared'); load();
+    }
+  );
 }
-async function dismissFailed(enc){
-  await fetch('/api/clear-failed',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({url:decodeURIComponent(enc)})});
-  load();
+function dismissFailed(enc){
+  const url=decodeURIComponent(enc);
+  showConfirm(
+    'Dismiss failed fetch',
+    `Remove this failed fetch record?\n${url}`,
+    'Dismiss',
+    async()=>{
+      await fetch('/api/clear-failed',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({url})});
+      load();
+    }
+  );
 }
 
 // ── Blocklist ──────────────────────────────────────────────────────────────
@@ -1166,6 +1374,60 @@ def api_delete():
         META_FILE.write_text(json.dumps(meta, indent=2), "utf-8")
         _meta_cache_ts = 0.0
     return jsonify({"ok": True})
+
+@app.route("/api/delete-bulk", methods=["POST"])
+def api_delete_bulk():
+    """Delete multiple cached items in one request.
+
+    Accepts either:
+      {"urls": ["https://..."]}    — delete a specific list of URLs
+      {"host": "example.com"}     — delete every URL for that hostname
+                                    (server-side, not capped by the 500-item UI limit)
+
+    Returns the count of entries actually removed from _meta.json.
+    """
+    global _meta_cache_ts
+    data  = request.get_json() or {}
+    meta  = load_meta()
+    cached = meta.get("cached_urls", {})
+    deleted = 0
+
+    if "host" in data:
+        # Server-side host filter — finds all URLs regardless of the 500-item UI cap
+        host   = data["host"].strip().lower()
+        to_del = [url for url in list(cached.keys())
+                  if urlparse(url).hostname == host]
+        for url in to_del:
+            info = cached.pop(url)
+            try:
+                cp = CACHE_DIR / info["path"]
+                cp.unlink(missing_ok=True)
+                cp.with_suffix(cp.suffix + ".meta.json").unlink(missing_ok=True)
+            except Exception:
+                pass
+            deleted += 1
+    else:
+        # Client-provided URL list (selected checkboxes)
+        urls = data.get("urls", [])
+        if not urls:
+            return abort(400)
+        for url in urls:
+            if url in cached:
+                info = cached.pop(url)
+                try:
+                    cp = CACHE_DIR / info["path"]
+                    cp.unlink(missing_ok=True)
+                    cp.with_suffix(cp.suffix + ".meta.json").unlink(missing_ok=True)
+                except Exception:
+                    pass
+                deleted += 1
+
+    # Recompute stats and persist
+    meta["stats"]["total"] = len(cached)
+    meta["stats"]["bytes"] = sum(v.get("size", 0) for v in cached.values())
+    META_FILE.write_text(json.dumps(meta, indent=2), "utf-8")
+    _meta_cache_ts = 0.0  # Invalidate in-memory cache so next poll sees updated state
+    return jsonify({"ok": True, "deleted": deleted})
 
 @app.route("/api/queue-clear", methods=["POST"])
 def api_queue_clear():
