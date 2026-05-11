@@ -21,3 +21,6 @@ env/
 .idea/
 *.swp
 *.swo
+
+# Claude Code per-user settings (project-shared hooks/commands live in .claude/settings.json + .claude/commands/)
+.claude/settings.local.json

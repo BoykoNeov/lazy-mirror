@@ -2251,45 +2251,47 @@ def _browser_rewrite_html(raw: bytes, page_url: str, host: str, sidecar: Path) -
     - absolute http(s)://any-host/path  ->  /any-host/path
     - root-relative /path               ->  /current-host/path
     - charset: decode with original charset, serve as utf-8 with updated meta
+
+    Single-pass alternation is intentional: a previous two-pass version (absolute
+    then root-relative) double-rewrote absolute URLs because the second pass
+    matched its own output. Keep both forms in one regex so each URL is touched
+    exactly once.
     """
     text = _smart_decode(raw, sidecar)
 
-    # Absolute URLs in tag attributes -> /host/path
-    def _abs_to_local(m):
+    # Attribute rewriter — handles both absolute and root-relative in one match
+    # so an absolute URL rewritten to /host/path is never re-matched by a
+    # root-relative pass on the same string.
+    def _attr_rewrite(m):
         attr  = m.group(1)
-        h     = m.group(2)
-        path  = m.group(3) or "/"
-        quote = m.group(4)
-        return attr + "/" + h + path + quote
+        quote = m.group(5)
+        if m.group(2):
+            # Absolute branch: https?://<host><path>
+            h    = m.group(2)
+            path = m.group(3) or "/"
+            return attr + "/" + h + path + quote
+        # Root-relative branch: /<path>
+        return attr + "/" + host + m.group(4) + quote
 
     text = re.sub(
         r'((?:src|href|action|data-src|data-lazy|data-original|poster|data-bg|data-background)'
-        r'\s*=\s*["\'])https?://([^/"\'>\s]+)(/[^"\'>\s]*)?(["\'])',
-        _abs_to_local, text, flags=re.IGNORECASE)
+        r'\s*=\s*["\'])'
+        r'(?:https?://([^/"\'>\s]+)(/[^"\'>\s]*)?|(/[^"\'>\s]+))'
+        r'(["\'])',
+        _attr_rewrite, text, flags=re.IGNORECASE)
 
-    # Root-relative /path -> /current-host/path
-    def _root_to_local(m):
-        attr  = m.group(1)
-        rpath = m.group(2)
-        quote = m.group(3)
-        return attr + "/" + host + rpath + quote
+    # url(...) rewriter for inline style attributes and <style> blocks —
+    # same single-pass rationale as the attribute rewriter above.
+    def _url_rewrite(m):
+        if m.group(1):
+            return 'url("/' + m.group(1) + (m.group(2) or "/") + '")'
+        return 'url("/' + host + m.group(3) + '")'
 
     text = re.sub(
-        r'((?:src|href|action|data-src|data-lazy|data-original|poster|data-bg|data-background)'
-        r'\s*=\s*["\'])(/[^"\'>\s]+)(["\'])',
-        _root_to_local, text, flags=re.IGNORECASE)
-
-    # Absolute url() in style attributes / style blocks
-    text = re.sub(
-        r'url\(["\']?https?://([^/"\')\s]+)(/[^"\')\s]*)?["\']?\)',
-        lambda m: 'url("/' + m.group(1) + (m.group(2) or "/") + '")',
-        text, flags=re.IGNORECASE)
-
-    # Root-relative url()
-    text = re.sub(
-        r'url\(["\']?(/[^"\')\s]+)["\']?\)',
-        lambda m: 'url("/' + host + m.group(1) + '")',
-        text, flags=re.IGNORECASE)
+        r'url\(["\']?'
+        r'(?:https?://([^/"\')\s]+)(/[^"\')\s]*)?|(/[^"\')\s]+))'
+        r'["\']?\)',
+        _url_rewrite, text, flags=re.IGNORECASE)
 
     # Update/add charset meta so browser knows it's utf-8
     text = re.sub(r'charset\s*=\s*[\w-]+', 'charset=utf-8', text, flags=re.IGNORECASE)
@@ -2298,28 +2300,35 @@ def _browser_rewrite_html(raw: bytes, page_url: str, host: str, sidecar: Path) -
 
 
 def _browser_rewrite_css(raw: bytes, page_url: str, host: str, sidecar: Path) -> bytes:
-    """Rewrite CSS url() and @import for cache browser."""
+    """Rewrite CSS url() and @import for cache browser.
+
+    Single-pass alternation per rule for the same reason as _browser_rewrite_html:
+    a two-pass version would re-match the first pass's output and double-prefix
+    every absolute URL.
+    """
     text = _smart_decode(raw, sidecar)
 
-    text = re.sub(
-        r'url\(["\']?https?://([^/"\')\s]+)(/[^"\')\s]*)?["\']?\)',
-        lambda m: 'url("/' + m.group(1) + (m.group(2) or "/") + '")',
-        text, flags=re.IGNORECASE)
+    def _url_rewrite(m):
+        if m.group(1):
+            return 'url("/' + m.group(1) + (m.group(2) or "/") + '")'
+        return 'url("/' + host + m.group(3) + '")'
 
     text = re.sub(
-        r'url\(["\']?(/[^"\')\s]+)["\']?\)',
-        lambda m: 'url("/' + host + m.group(1) + '")',
-        text, flags=re.IGNORECASE)
+        r'url\(["\']?'
+        r'(?:https?://([^/"\')\s]+)(/[^"\')\s]*)?|(/[^"\')\s]+))'
+        r'["\']?\)',
+        _url_rewrite, text, flags=re.IGNORECASE)
+
+    def _import_rewrite(m):
+        if m.group(1):
+            return '@import "/' + m.group(1) + (m.group(2) or "/") + '"'
+        return '@import "/' + host + m.group(3) + '"'
 
     text = re.sub(
-        r'@import\s+["\']https?://([^/"\')\s]+)(/[^"\')\s]*)?["\']',
-        lambda m: '@import "/' + m.group(1) + (m.group(2) or "/") + '"',
-        text, flags=re.IGNORECASE)
-
-    text = re.sub(
-        r'@import\s+["\']?(/[^"\')\s]+)["\']?',
-        lambda m: '@import "/' + host + m.group(1) + '"',
-        text, flags=re.IGNORECASE)
+        r'@import\s+["\']?'
+        r'(?:https?://([^/"\')\s]+)(/[^"\')\s]*)?|(/[^"\')\s]+))'
+        r'["\']?',
+        _import_rewrite, text, flags=re.IGNORECASE)
 
     return text.encode("utf-8")
 

@@ -298,3 +298,73 @@ Python 3.10+ required. Tested on Windows 10/11.
 Check `offline_cache/_queue.json` for current queue state.
 Check `offline_cache/_proxy.log` for detailed fetch/harvest logs.
 Run `DIAGNOSE.bat` for environment info.
+
+---
+
+## Tests
+
+A pytest suite lives in `tests/`. The whole suite is fast (~1 second on a typical
+machine) and the pre-commit hook enforces green tests before every commit.
+
+```
+python -m pytest -q
+```
+
+Test files and what they cover:
+- `tests/test_proxy_addon.py` — harvester, sanitize_url, url_to_path, queue, state I/O, write_cache
+- `tests/test_dashboard.py` — API routes (cache, settings, delete, refetch, queue), URL map, export rewriter
+- `tests/test_startup_recovery.py` — `_meta.json` auto-heal, `_queue.json` restore, corrupt-file fallback
+- `tests/test_state_concurrency.py` — concurrent `_patch_state` writers under threads
+- `tests/test_browser_rewrite.py` — `_browser_rewrite_html` (cache browser, port 7780)
+- `tests/test_export_roundtrip.py` — end-to-end /api/export with on-disk verification
+
+**Rule: tests must be green before commit.** The pre-commit hook will block a commit
+when pytest is red.
+
+---
+
+## Workflow
+
+For anything bigger than a one-line fix, prefer the explore-plan-code-commit loop:
+1. Read relevant code first (Read, Grep, Glob)
+2. Sketch the approach in chat
+3. Code with small, focused edits
+4. Run `/test` if you haven't already
+5. Commit
+
+For non-trivial features (new asset category, export rewriter rework, etc.) drop
+a short three-file plan in `docs/dev/<task-name>/` first — see `docs/dev/README.md`.
+
+---
+
+## Slash Commands
+
+Project-defined commands live in `.claude/commands/`. Available:
+
+| Command | What it does |
+|---------|--------------|
+| `/state` | Dump `_state.json`, `_queue.json` summary, `_meta.json` stats, log tails |
+| `/test` | Run the pytest suite, surface pass/fail |
+| `/syntax-check` | Quick AST syntax check on both src files |
+| `/sync-temp` | Copy `src/*.py` to `M:\temp\lazy mirro claude 3\src\` |
+| `/diagnose` | Run DIAGNOSE.bat + recent log tails |
+
+---
+
+## Hooks (`.claude/settings.json`)
+
+Two project-shared hooks are configured:
+
+1. **PostToolUse (Edit / Write / MultiEdit)** → `.claude/hooks/post_edit_src.py`
+   - On every edit to a file under `src/*.py`:
+     - copies it to `M:\temp\lazy mirro claude 3\src\`
+     - runs pytest, reports a one-line summary (non-blocking — informational only)
+
+2. **PreToolUse (Bash)** → `.claude/hooks/pre_commit_test.py`
+   - When the Bash command matches `git commit ...`:
+     - runs pytest
+     - on red, prints failures and blocks the commit
+     - on green, allows the commit
+
+`.claude/settings.local.json` is per-user and gitignored; `.claude/settings.json`
+and `.claude/commands/` are committed and shared.
